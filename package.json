@@ -9,7 +9,8 @@
     "lint": "eslint",
     "test:scoring": "node scripts/test-scoring-engine.js",
     "test:db": "node scripts/test-database-integration.js",
-    "test": "node scripts/test-scoring-engine.js && node scripts/test-database-integration.js"
+    "test:scoreboard": "node scripts/test-scoreboard-realtime-drift.mjs",
+    "test": "node scripts/test-scoring-engine.js && node scripts/test-database-integration.js && node scripts/test-scoreboard-realtime-drift.mjs"
   },
   "dependencies": {
     "@base-ui/react": "^1.9.0",
@@ -33,6 +34,7 @@
     "eslint": "^9",
     "eslint-config-next": "16.4.6",
     "pg-mem": "^3.0.14",
+    "supabase": "^3.2.0",
     "tailwindcss": "4.3.3",
     "typescript": "^5"
   }

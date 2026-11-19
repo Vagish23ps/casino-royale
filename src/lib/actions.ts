@@ -531,6 +531,24 @@ export async function recordScoreBatchAction(params: {
     revalidatePath("/admin/live-display");
     revalidatePath("/public-view");
 
+    // Broadcast instant real-time notification to active live scoreboards
+    try {
+      const channel = supabase.channel(`scoreboard:${eventId}`);
+      await channel.send({
+        type: "broadcast",
+        event: "score_update",
+        payload: {
+          eventId,
+          roundId: params.roundId,
+          updated_scores: rpcData.updated_scores || {},
+          timestamp: Date.now(),
+        },
+      });
+      await supabase.removeChannel(channel);
+    } catch {
+      // Non-blocking fallback: scoreboards still refresh via Next.js revalidation and interval polling
+    }
+
     return { success: true, data: rpcData };
   } catch (err: unknown) {
     return {
@@ -577,6 +595,26 @@ export async function reverseScoreTransactionAction(
     revalidatePath("/admin/live-display");
     revalidatePath("/public-view");
 
+    // Broadcast instant real-time notification to active live scoreboards
+    try {
+      const eventId = rpcData.event_id || (await getActiveEventId(supabase));
+      const channel = supabase.channel(`scoreboard:${eventId}`);
+      await channel.send({
+        type: "broadcast",
+        event: "score_update",
+        payload: {
+          eventId,
+          teamId: rpcData.team_id,
+          resulting_score: rpcData.resulting_score,
+          points_delta: rpcData.points_delta,
+          timestamp: Date.now(),
+        },
+      });
+      await supabase.removeChannel(channel);
+    } catch {
+      // Non-blocking fallback
+    }
+
     return { success: true, data: rpcData };
   } catch (err: unknown) {
     return {
@@ -600,6 +638,10 @@ export async function updateEventSettingsAction(data: {
   try {
     const { supabase } = await getAuthenticatedUser();
     const eventId = await getActiveEventId(supabase);
+
+    if (typeof data.starting_score === "number" && data.starting_score < 0) {
+      return { success: false, error: "starting_score must be non-negative (≥ 0)", code: "22023" };
+    }
 
     // Call authoritative RPC enforcing consistent lock hierarchy (events -> event_settings)
     const { data: rpcData, error: rpcError } = await supabase.rpc(

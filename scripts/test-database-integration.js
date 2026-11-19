@@ -252,6 +252,9 @@ async function runDatabaseIntegrationTests() {
       if (isNaN(valNum) || !isFinite(valNum)) {
         throw new Error(`[22023] Operation item at index ${idx} has unsupported numeric value "${op.input_value}"`);
       }
+      if (valNum < 0) {
+        throw new Error(`[22023] Operation item at index ${idx} input_value must be non-negative (got ${op.input_value}). Use SUBTRACT with a positive value to reduce a score.`);
+      }
       if (Math.abs(valNum) > 9999999999.99) {
         throw new Error(`[22023] Operation item at index ${idx} input_value exceeds maximum allowed precision NUMERIC(12,2): ${op.input_value}`);
       }
@@ -371,8 +374,9 @@ async function runDatabaseIntegrationTests() {
           v_res_score = Number((v_prev_score + v_val).toFixed(2));
           v_delta = v_val;
         } else if (v_op_type === 'SUBTRACT') {
-          v_res_score = Number((v_prev_score - v_val).toFixed(2));
-          v_delta = -v_val;
+          // Zero-floor: clamp to 0 when penalty exceeds available score
+          v_res_score = Math.max(0, Number((v_prev_score - v_val).toFixed(2)));
+          v_delta = Number((v_res_score - v_prev_score).toFixed(2));
         } else if (v_op_type === 'MULTIPLY') {
           v_res_score = Number((v_prev_score * v_val).toFixed(2));
           v_delta = Number((v_res_score - v_prev_score).toFixed(2));
@@ -385,11 +389,6 @@ async function runDatabaseIntegrationTests() {
         } else if (v_op_type === 'SET_SCORE') {
           v_res_score = v_val;
           v_delta = Number((v_val - v_prev_score).toFixed(2));
-        }
-
-        // Enforce Negative Scores Policy
-        if (!v_allow_negative && v_res_score < 0) {
-          throw new Error(`[22000] Negative scores are not permitted for event ${p_event_id} (Team ${v_team_id} resulting score: ${v_res_score})`);
         }
 
         // Generate Transaction ID and Insert into immutable ledger
@@ -505,9 +504,9 @@ async function runDatabaseIntegrationTests() {
     const v_rev_delta = -Number(v_orig.points_delta);
     const v_res_score = Number((v_prev_score + v_rev_delta).toFixed(2));
 
-    // 6. Enforce Negative Score Policy on Reversal
-    if (!v_allow_negative && v_res_score < 0) {
-      throw new Error(`[22000] Cannot reverse transaction ${p_transaction_id}: resulting score ${v_res_score} would be negative and allow_negative_scores is disabled for event ${v_orig.event_id}`);
+    // Enforce Zero-Floor Policy on Reversal
+    if (v_res_score < 0) {
+      throw new Error(`[22000] Cannot reverse transaction ${p_transaction_id}: resulting score ${v_res_score} would be negative and violates the zero-floor policy for event ${v_orig.event_id}`);
     }
 
     // 7. Insert Reversal Record
@@ -765,12 +764,18 @@ async function runDatabaseIntegrationTests() {
   const t3Current = db.public.many(`SELECT total_score FROM v_public_overall_leaderboard WHERE team_id = '${TEAM_3_ID}'`)[0].total_score;
   assert(Number(t3Current) === 40, 'Team 3 current score is 40');
 
-  // Now try to reverse bigTxId (which added 200):
-  // Reversing it subtracts 200. But current score is 40! 40 - 200 = -160.
-  // With allow_negative_scores = FALSE, reversal MUST be rejected!
+  // Negative input rejected with 22023
+  assertThrows(() => {
+    pgRecordScoreBatch(EVENT_ID, ROUND_1_ID, 'k-neg-input-t3', [
+      { team_id: TEAM_3_ID, operation_type: 'SUBTRACT', input_value: -10 }
+    ]);
+  }, '[22023]', 'Negative input_value rejected with ERRCODE 22023');
+
+  // Attempting to reverse bigTxId (undoing +200 on score 40 -> -160)
+  // must be rejected under the zero-floor policy with ERRCODE 22000
   assertThrows(() => {
     pgReverseScoreTransaction(bigTxId, 'Reversing big add would make score negative');
-  }, '[22000]', 'Reversal resulting in negative score blocked when allow_negative_scores = false');
+  }, '[22000]', 'Reversal resulting in negative score blocked under zero-floor policy');
 
   // Verify ledger count remained unchanged and score remained 40
   const t3AfterRevFail = db.public.many(`SELECT total_score FROM v_public_overall_leaderboard WHERE team_id = '${TEAM_3_ID}'`)[0].total_score;
@@ -1058,8 +1063,8 @@ async function runDatabaseIntegrationTests() {
     pgUpdateEventSettings(EVENT_ID, null, null, null, null, 'invalid_direction');
   }, '[22023]', 'Group 18: Invalid sort_direction rejected with 22023');
 
-  console.log('\n--- GROUP 19: REVERSAL CONCURRENT WITH EVENT_SETTINGS UPDATES (SIMULATION) ---');
-  // Reversal must acquire event_settings lock and observe committed allow_negative_scores
+  console.log('\n--- GROUP 19: REVERSAL ZERO-FLOOR POLICY (SIMULATION) ---');
+  // Reversal must acquire event_settings lock and enforce unconditional zero-floor
   // Query Team 1's authoritative current score before starting the test:
   const curT1Rows = db.public.many(`SELECT COALESCE(SUM(points_delta), 0.00) AS d FROM score_transactions WHERE team_id = '${TEAM_1_ID}' AND event_id = '${EVENT_ID}'`);
   const t1ScoreBefore = 140.00 + Number(curT1Rows[0].d);
@@ -1077,23 +1082,13 @@ async function runDatabaseIntegrationTests() {
   ]);
 
   // Current score is now exactly 20.
-  // With allow_negative_scores = FALSE, reversing txToReverseId (undoing +100 -> delta -100)
-  // would result in 20 - 100 = -80.
-  // Under the event_settings lock, the reversal reads allow_negative_scores = FALSE and MUST fail!
+  // Undoing txToReverseId (+100 -> delta -100) would result in 20 - 100 = -80.
+  // Under the zero-floor policy, a reversal cannot produce a negative score, so it is rejected with 22000.
   assertThrows(() => {
     pgReverseScoreTransaction(txToReverseId, 'Attempting reversal that would make score negative');
-  }, '[22000]', 'Group 19: Reversal blocked when allow_negative_scores is FALSE (locked settings state)');
+  }, '[22000]', 'Group 19: Reversal blocked when resulting score would be negative (zero-floor policy)');
 
-  // Now, update event_settings to allow_negative_scores = TRUE via update_event_settings
-  pgUpdateEventSettings(EVENT_ID, true, false, null, true, 'desc');
-
-  // Now the reversal under lock observes allow_negative_scores = TRUE and succeeds!
-  const revG19Success = pgReverseScoreTransaction(txToReverseId, 'Reversal with allow_negative_scores enabled');
-  assert(revG19Success.success === true, 'Group 19: Reversal succeeds after allow_negative_scores updated to TRUE');
-  assert(revG19Success.resulting_score === -80, 'Group 19: Resulting score is -80 (negative allowed)');
-
-  // Restore settings back to FALSE and restore Team 1 back to positive score
-  pgUpdateEventSettings(EVENT_ID, true, false, null, false, 'desc');
+  // Restore Team 1 back to positive score
   pgRecordScoreBatch(EVENT_ID, ROUND_1_ID, 'k-g19-restore', [
     { team_id: TEAM_1_ID, operation_type: 'ADD', input_value: 240 }
   ]);

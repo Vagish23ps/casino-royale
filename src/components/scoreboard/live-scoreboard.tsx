@@ -38,12 +38,15 @@ type RankShiftInfo = {
 };
 
 export function LiveScoreboard({
+  initialEvent,
   initialSettings,
   initialRound,
   initialLeaderboard,
   isPublicView = false,
   headingFontClassName,
 }: LiveScoreboardProps) {
+  const [event] = useState<Event | null>(initialEvent);
+  const eventId = event?.id || initialEvent?.id || null;
   const [leaderboard, setLeaderboard] = useState<LeaderboardEntry[]>(initialLeaderboard);
   const [settings] = useState<EventSettings | null>(initialSettings);
   const [activeRound, setActiveRound] = useState<Round | null>(initialRound);
@@ -59,14 +62,17 @@ export function LiveScoreboard({
   const [scoreDeltas, setScoreDeltas] = useState<Record<string, number>>({});
   const [updatedTeamsCount, setUpdatedTeamsCount] = useState(0);
 
-  const pendingLeaderboardRef = useRef<LeaderboardEntry[] | null>(null);
   const spinTimerRef = useRef<NodeJS.Timeout | null>(null);
 
-  // Score and Rank tracking refs
+  // Score and Rank tracking refs (Authoritative baseline)
   const prevLeaderId = useRef<string | null>(initialLeaderboard[0]?.team_id || null);
   const prevRanksRef = useRef<Record<string, number>>({});
   const prevScoresRef = useRef<Record<string, number>>({});
   const isInitialMountRef = useRef<boolean>(true);
+
+  // Request sequencing and deduplication refs to prevent stale/out-of-order overwrite
+  const latestRequestIdRef = useRef<number>(0);
+  const latestProcessedTimestampRef = useRef<number>(0);
 
   // Initialize previous scores & ranks on initial mount
   useEffect(() => {
@@ -85,43 +91,8 @@ export function LiveScoreboard({
     if (spinTimerRef.current) clearTimeout(spinTimerRef.current);
     setShowCurtainIntro(false);
     setIsSlotSpinning(false);
-
-    if (pendingLeaderboardRef.current) {
-      const nextLeaderboard = pendingLeaderboardRef.current;
-      pendingLeaderboardRef.current = null;
-
-      const newShifts: Record<string, RankShiftInfo> = {};
-      let hasShifts = false;
-
-      nextLeaderboard.forEach((t) => {
-        const oldRank = prevRanksRef.current[t.team_id];
-        if (oldRank !== undefined && oldRank !== t.rank) {
-          hasShifts = true;
-          newShifts[t.team_id] = {
-            from: oldRank,
-            to: t.rank,
-            direction: t.rank < oldRank ? "up" : "down",
-          };
-        }
-        prevRanksRef.current[t.team_id] = t.rank;
-        prevScoresRef.current[t.team_id] = t.total_score;
-      });
-
-      if (hasShifts) {
-        setRankShifts(newShifts);
-        setTimeout(() => setRankShifts({}), 6000);
-      }
-
-      const currentTopId = nextLeaderboard[0]?.team_id;
-      if (currentTopId && prevLeaderId.current && currentTopId !== prevLeaderId.current) {
-        setCrownCelebration(true);
-        casinoSound.playChampionFanfare();
-        setTimeout(() => setCrownCelebration(false), 5500);
-      }
-      prevLeaderId.current = currentTopId || null;
-
-      setLeaderboard(nextLeaderboard);
-    }
+    setAffectedTeamIds([]);
+    setScoreDeltas({});
   }, []);
 
   // When the Cinematic Curtain introduction finishes, transition directly to slot-machine reel spin on scoreboard
@@ -132,49 +103,10 @@ export function LiveScoreboard({
     // Audio cue for slot reel spinning
     casinoSound.playSlotReelClick(1.2);
 
-    // Schedule settling of all reels and board rank transitions (~3.6s total reel sequence)
+    // Schedule settling of all reels
+    if (spinTimerRef.current) clearTimeout(spinTimerRef.current);
     spinTimerRef.current = setTimeout(() => {
       setIsSlotSpinning(false);
-
-      if (pendingLeaderboardRef.current) {
-        const nextLeaderboard = pendingLeaderboardRef.current;
-        pendingLeaderboardRef.current = null;
-
-        // Calculate rank shifts for visible podium and leaderboard transitions
-        const newShifts: Record<string, RankShiftInfo> = {};
-        let hasShifts = false;
-
-        nextLeaderboard.forEach((t) => {
-          const oldRank = prevRanksRef.current[t.team_id];
-          if (oldRank !== undefined && oldRank !== t.rank) {
-            hasShifts = true;
-            newShifts[t.team_id] = {
-              from: oldRank,
-              to: t.rank,
-              direction: t.rank < oldRank ? "up" : "down",
-            };
-          }
-          prevRanksRef.current[t.team_id] = t.rank;
-          prevScoresRef.current[t.team_id] = t.total_score;
-        });
-
-        if (hasShifts) {
-          setRankShifts(newShifts);
-          setTimeout(() => setRankShifts({}), 6500);
-        }
-
-        // Check if 1st place champion has changed
-        const currentTopId = nextLeaderboard[0]?.team_id;
-        if (currentTopId && prevLeaderId.current && currentTopId !== prevLeaderId.current) {
-          setCrownCelebration(true);
-          casinoSound.playChampionFanfare();
-          setTimeout(() => setCrownCelebration(false), 5500);
-        }
-        prevLeaderId.current = currentTopId || null;
-
-        // Apply updated confirmed leaderboard
-        setLeaderboard(nextLeaderboard);
-      }
 
       // Clear deltas and affected markers after celebration window
       setTimeout(() => {
@@ -184,30 +116,42 @@ export function LiveScoreboard({
     }, 3600);
   }, []);
 
-  // Fetch latest leaderboard and round directly from Supabase
+  // Fetch latest leaderboard and round directly from Supabase view (authoritative source of truth)
   const refreshLeaderboard = useCallback(async () => {
+    const requestId = ++latestRequestIdRef.current;
     try {
       const supabase = createClient();
 
-      // 1. Fetch active round
-      const { data: rndData } = await supabase
+      // 1. Fetch active round (scoped to eventId)
+      let rndQuery = supabase
         .from("rounds")
         .select("*")
         .eq("status", "active")
-        .is("deleted_at", null)
+        .is("deleted_at", null);
+      if (eventId) {
+        rndQuery = rndQuery.eq("event_id", eventId);
+      }
+      const { data: rndData } = await rndQuery
         .order("round_number", { ascending: false })
         .limit(1)
         .maybeSingle();
+
+      if (requestId !== latestRequestIdRef.current) return;
 
       if (rndData) {
         setActiveRound(rndData as Round);
       }
 
-      // 2. Fetch overall leaderboard
-      const { data: viewData, error } = await supabase
+      // 2. Fetch authoritative overall leaderboard from view (scoped to eventId)
+      let lbQuery = supabase
         .from("v_public_overall_leaderboard")
-        .select("*")
-        .order("rank", { ascending: true });
+        .select("*");
+      if (eventId) {
+        lbQuery = lbQuery.eq("event_id", eventId);
+      }
+      const { data: viewData, error } = await lbQuery.order("rank", { ascending: true });
+
+      if (requestId !== latestRequestIdRef.current) return;
 
       let nextLeaderboard: LeaderboardEntry[] = [];
 
@@ -221,11 +165,17 @@ export function LiveScoreboard({
           rank: Number(d.rank || 1),
         }));
       } else {
-        // Fallback: direct team list with starting score
-        const { data: tData } = await supabase
+        // Fallback: direct team list with starting score (scoped to eventId)
+        let tQuery = supabase
           .from("teams")
           .select("*")
           .is("deleted_at", null);
+        if (eventId) {
+          tQuery = tQuery.eq("event_id", eventId);
+        }
+        const { data: tData } = await tQuery;
+
+        if (requestId !== latestRequestIdRef.current) return;
 
         if (tData && tData.length > 0) {
           const startingScore = Number(settings?.starting_score || 0.0);
@@ -241,8 +191,9 @@ export function LiveScoreboard({
       }
 
       if (nextLeaderboard.length === 0) return;
+      if (requestId !== latestRequestIdRef.current) return;
 
-      // On initial load or refresh, never replay old animations
+      // On initial load or page refresh, establish baseline without replaying stale animations
       if (isInitialMountRef.current) {
         isInitialMountRef.current = false;
         nextLeaderboard.forEach((t) => {
@@ -254,7 +205,7 @@ export function LiveScoreboard({
         return;
       }
 
-      // Check which teams received actual score changes
+      // Check which teams received actual score changes (detect deltas purely for animations)
       const affected: string[] = [];
       const deltas: Record<string, number> = {};
 
@@ -262,64 +213,172 @@ export function LiveScoreboard({
         const oldScore = prevScoresRef.current[team.team_id];
         if (oldScore !== undefined && oldScore !== team.total_score) {
           affected.push(team.team_id);
+          // Delta is the actual change from previous displayed score to authoritative new score.
+          // For SET_SCORE, this reflects (resulting_score - oldScore), never an additive accumulation.
           deltas[team.team_id] = team.total_score - oldScore;
         }
       });
 
+      // Compute rank shifts
+      const newShifts: Record<string, RankShiftInfo> = {};
+      let hasShifts = false;
+
+      nextLeaderboard.forEach((t) => {
+        const oldRank = prevRanksRef.current[t.team_id];
+        if (oldRank !== undefined && oldRank !== t.rank) {
+          hasShifts = true;
+          newShifts[t.team_id] = {
+            from: oldRank,
+            to: t.rank,
+            direction: t.rank < oldRank ? "up" : "down",
+          };
+        }
+        // Authoritatively update tracking baseline with the exact new values
+        prevRanksRef.current[t.team_id] = t.rank;
+        prevScoresRef.current[t.team_id] = t.total_score;
+      });
+
+      if (hasShifts) {
+        setRankShifts(newShifts);
+        setTimeout(() => setRankShifts({}), 6500);
+      }
+
+      // Check if 1st place champion has changed
+      const currentTopId = nextLeaderboard[0]?.team_id;
+      if (currentTopId && prevLeaderId.current && currentTopId !== prevLeaderId.current) {
+        setCrownCelebration(true);
+        casinoSound.playChampionFanfare();
+        setTimeout(() => setCrownCelebration(false), 5500);
+      }
+      prevLeaderId.current = currentTopId || null;
+
       if (affected.length > 0) {
-        // Trigger the coordinated Slot Machine Score Reveal sequence for this confirmed scoring batch!
-        pendingLeaderboardRef.current = nextLeaderboard;
+        // Coordinated animation reveal sequence:
+        // Update authoritative leaderboard state immediately so SlotScoreReel spins directly
+        // to the NEW target digits!
+        setLeaderboard(nextLeaderboard);
         setAffectedTeamIds(affected);
         setScoreDeltas(deltas);
         setUpdatedTeamsCount(affected.length);
         setShowCurtainIntro(true);
       } else {
-        // No scores changed (e.g. metadata/settings update)
-        // Check for rank order changes
-        const newShifts: Record<string, RankShiftInfo> = {};
-        let hasShifts = false;
-
-        nextLeaderboard.forEach((t) => {
-          const oldRank = prevRanksRef.current[t.team_id];
-          if (oldRank !== undefined && oldRank !== t.rank) {
-            hasShifts = true;
-            newShifts[t.team_id] = {
-              from: oldRank,
-              to: t.rank,
-              direction: t.rank < oldRank ? "up" : "down",
-            };
-          }
-          prevRanksRef.current[t.team_id] = t.rank;
-          prevScoresRef.current[t.team_id] = t.total_score;
-        });
-
-        if (hasShifts) {
-          setRankShifts(newShifts);
-          setTimeout(() => setRankShifts({}), 6000);
-        }
-
-        const currentTopId = nextLeaderboard[0]?.team_id;
-        if (currentTopId && prevLeaderId.current && currentTopId !== prevLeaderId.current) {
-          setCrownCelebration(true);
-          casinoSound.playChampionFanfare();
-          setTimeout(() => setCrownCelebration(false), 5500);
-        }
-        prevLeaderId.current = currentTopId || null;
-
+        // No score changes (e.g. metadata/settings update)
         setLeaderboard(nextLeaderboard);
       }
     } catch {
       // Handled gracefully
     }
-  }, [settings]);
+  }, [eventId, settings]);
 
-  // Realtime subscription to teams, rounds and event_settings
+  // Apply authoritative scores directly from real-time broadcast payload (resulting_score)
+  // This guarantees zero score drift, instant updates, and full idempotency
+  const applyDirectAuthoritativeScores = useCallback((scores: Record<string, number>) => {
+    setLeaderboard((prevLeaderboard) => {
+      const affected: string[] = [];
+      const deltas: Record<string, number> = {};
+
+      const updated = prevLeaderboard.map((team) => {
+        if (scores[team.team_id] !== undefined) {
+          const newScore = scores[team.team_id];
+          const oldScore = prevScoresRef.current[team.team_id] ?? team.total_score;
+          if (newScore !== oldScore) {
+            affected.push(team.team_id);
+            // Delta is purely for visual animation badges, calculated from old score to new authoritative resulting score
+            // For SET_SCORE, this reflects (resulting_score - oldScore), never an additive accumulation.
+            deltas[team.team_id] = newScore - oldScore;
+            prevScoresRef.current[team.team_id] = newScore;
+          }
+          return { ...team, total_score: newScore };
+        }
+        return team;
+      });
+
+      if (affected.length === 0) {
+        return prevLeaderboard; // Idempotent: duplicate notification ignored
+      }
+
+      // Re-sort and re-rank authoritatively
+      const sorted = [...updated].sort((a, b) => b.total_score - a.total_score);
+      const ranked = sorted.map((t, idx) => ({ ...t, rank: idx + 1 }));
+
+      // Compute rank shifts
+      const newShifts: Record<string, RankShiftInfo> = {};
+      let hasShifts = false;
+      ranked.forEach((t) => {
+        const oldRank = prevRanksRef.current[t.team_id];
+        if (oldRank !== undefined && oldRank !== t.rank) {
+          hasShifts = true;
+          newShifts[t.team_id] = {
+            from: oldRank,
+            to: t.rank,
+            direction: t.rank < oldRank ? "up" : "down",
+          };
+        }
+        prevRanksRef.current[t.team_id] = t.rank;
+      });
+
+      if (hasShifts) {
+        setRankShifts(newShifts);
+        setTimeout(() => setRankShifts({}), 6500);
+      }
+
+      // Check if 1st place champion has changed
+      const currentTopId = ranked[0]?.team_id;
+      if (currentTopId && prevLeaderId.current && currentTopId !== prevLeaderId.current) {
+        setCrownCelebration(true);
+        casinoSound.playChampionFanfare();
+        setTimeout(() => setCrownCelebration(false), 5500);
+      }
+      prevLeaderId.current = currentTopId || null;
+
+      setAffectedTeamIds(affected);
+      setScoreDeltas(deltas);
+      setUpdatedTeamsCount(affected.length);
+      setShowCurtainIntro(true);
+
+      return ranked;
+    });
+  }, []);
+
+  // Realtime subscription to teams, rounds, event_settings and broadcast score updates
   useEffect(() => {
     let channel: ReturnType<ReturnType<typeof createClient>["channel"]> | null = null;
     try {
       const supabase = createClient();
+      const channelName = eventId ? `scoreboard:${eventId}` : "public-scoreboard-realtime";
+
       channel = supabase
-        .channel("public-scoreboard-realtime")
+        .channel(channelName)
+        .on("broadcast", { event: "score_update" }, (message) => {
+          const payload = message?.payload;
+          if (payload?.eventId && eventId && payload.eventId !== eventId) {
+            return; // Not for this event
+          }
+          if (payload?.timestamp && payload.timestamp < latestProcessedTimestampRef.current) {
+            // Discard older out-of-order broadcast
+            return;
+          }
+          if (payload?.timestamp) {
+            latestProcessedTimestampRef.current = payload.timestamp;
+          }
+
+          // Extract authoritative resulting scores from broadcast payload
+          const directScores: Record<string, number> = {};
+          if (payload?.updated_scores && typeof payload.updated_scores === "object") {
+            Object.entries(payload.updated_scores).forEach(([tId, s]) => {
+              directScores[tId] = Number(s);
+            });
+          } else if (payload?.teamId && payload.resulting_score !== undefined) {
+            directScores[payload.teamId] = Number(payload.resulting_score);
+          }
+
+          if (Object.keys(directScores).length > 0) {
+            applyDirectAuthoritativeScores(directScores);
+          }
+
+          // Also trigger authoritative database view refresh
+          refreshLeaderboard();
+        })
         .on(
           "postgres_changes",
           { event: "*", schema: "public", table: "teams" },
@@ -346,7 +405,7 @@ export function LiveScoreboard({
       // Realtime subscription setup fallback
     }
 
-    const interval = setInterval(refreshLeaderboard, 10000);
+    const interval = setInterval(refreshLeaderboard, 5000);
 
     return () => {
       if (channel) {
@@ -354,8 +413,9 @@ export function LiveScoreboard({
         supabase.removeChannel(channel);
       }
       clearInterval(interval);
+      if (spinTimerRef.current) clearTimeout(spinTimerRef.current);
     };
-  }, [refreshLeaderboard]);
+  }, [eventId, refreshLeaderboard, applyDirectAuthoritativeScores]);
 
   const toggleFullscreen = useCallback(() => {
     if (!document.fullscreenElement) {

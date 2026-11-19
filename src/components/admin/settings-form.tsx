@@ -34,6 +34,12 @@ export function SettingsForm({ initialEvent, initialSettings }: SettingsFormProp
     setSuccessMsg(null);
 
     const parsedStarting = parseFloat(startingScore);
+    if (!isNaN(parsedStarting) && parsedStarting < 0) {
+      setLoading(false);
+      setErrorMsg("Starting chip allocation must be non-negative (≥ 0).");
+      return;
+    }
+
     const res = await updateEventSettingsAction({
       leaderboard_frozen: frozen,
       leaderboard_visible: visible,
@@ -151,6 +157,8 @@ export function SettingsForm({ initialEvent, initialSettings }: SettingsFormProp
               </label>
               <input
                 type="number"
+                min="0"
+                step="any"
                 value={startingScore}
                 onChange={(e) => setStartingScore(e.target.value)}
                 className="w-full px-3 py-2 rounded-lg border border-border bg-background text-foreground text-sm font-mono font-semibold focus:outline-none focus:border-gold"

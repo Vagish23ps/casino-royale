@@ -834,26 +834,54 @@ async function runStagingVerification() {
     );
 
     // ------------------------------------------------------------------
-    // STEP 9: NEGATIVE SCORE POLICY ENFORCEMENT
+    // STEP 9: ZERO-FLOOR POLICY & NON-NEGATIVE INPUT ENFORCEMENT
     // ------------------------------------------------------------------
-    console.log("\n--- STEP 9: NEGATIVE SCORE POLICY ENFORCEMENT ---");
+    console.log("\n--- STEP 9: ZERO-FLOOR POLICY & NON-NEGATIVE INPUT ENFORCEMENT ---");
 
-    // Scoring that produces a negative score when allow_negative_scores is FALSE is rejected
+    // 9.1 Negative input values must be rejected with ERRCODE 22023
     await assertThrowsAsync(
       async () => {
         const { error } = await organizerClient1.rpc("record_score_batch", {
           p_event_id: eventId,
           p_round_id: round1Id,
-          p_idempotency_key: `${testRunId}-neg-fail`,
-          p_operations: [{ team_id: team1Id, operation_type: "SUBTRACT", input_value: 9999 }],
+          p_idempotency_key: `${testRunId}-neg-input-reject`,
+          p_operations: [{ team_id: team1Id, operation_type: "SUBTRACT", input_value: -10 }],
         });
         if (error) throw new Error(`[${error.code}] ${error.message}`);
       },
-      "22000",
-      "Negative score rejected when allow_negative_scores is FALSE"
+      "22023",
+      "Negative input_value is rejected with ERRCODE 22023"
     );
 
-    // 9.2 Starting Score Immutability & Event Settings Verification After Transactions Exist
+    // 9.2 SUBTRACT zero-floor: penalty larger than current score succeeds and clamps to 0
+    const { data: t1PreSubTxs } = await adminClient
+      .from("score_transactions")
+      .select("points_delta")
+      .eq("team_id", team1Id)
+      .eq("event_id", eventId);
+    const t1PreScore = 140.00 + t1PreSubTxs.reduce((sum, tx) => sum + Number(tx.points_delta), 0);
+
+    const { data: clampSubData, error: clampSubErr } = await organizerClient1.rpc("record_score_batch", {
+      p_event_id: eventId,
+      p_round_id: round1Id,
+      p_idempotency_key: `${testRunId}-clamp-sub`,
+      p_operations: [{ team_id: team1Id, operation_type: "SUBTRACT", input_value: t1PreScore + 500 }],
+      p_reason: "Zero-floor clamped subtract test",
+    });
+    if (clampSubErr) throw clampSubErr;
+    assert(clampSubData.transactions[0].resulting_score === 0, "SUBTRACT: penalty > score clamps resulting_score to 0");
+    assert(clampSubData.transactions[0].points_delta === -t1PreScore, `SUBTRACT: delta reflects actual clamped deduction (-${t1PreScore})`);
+
+    // Reverse the clamped SUBTRACT: restores +t1PreScore, returning team to t1PreScore
+    const clampTxId = clampSubData.transactions[0].id;
+    const { data: revClampData, error: revClampErr } = await organizerClient1.rpc("reverse_score_transaction", {
+      p_transaction_id: clampTxId,
+      p_reason: "Reversing clamped subtract",
+    });
+    if (revClampErr) throw revClampErr;
+    assert(revClampData.resulting_score === t1PreScore, `Reversing clamped subtract restores exact previous score (${t1PreScore})`);
+
+    // 9.3 Starting Score Immutability & Event Settings Verification After Transactions Exist
     // Changing starting_score after score transactions exist MUST be rejected
     await assertThrowsAsync(
       async () => {

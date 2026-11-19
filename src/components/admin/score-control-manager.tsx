@@ -49,7 +49,6 @@ export function ScoreControlManager({
   initialRounds,
   initialTeams,
   initialScores,
-  allowNegativeScores = false,
   dbError,
 }: ScoreControlManagerProps) {
   // Find active round as initial selection, or first round
@@ -197,13 +196,28 @@ export function ScoreControlManager({
     });
   };
 
-  // Compute provisional math for a team
+  // Compute provisional math for a team.
+  // Mirrors the authoritative PostgreSQL formulas exactly:
+  //   SUBTRACT: R = MAX(0, P - V)  — zero-floor, never rejects
+  //   delta = R - P  (actual clamped change, not raw -V)
+  //   Input V must be >= 0 for every operation.
   const calculateProvisional = useCallback(
     (currentScore: number, op: Operation, inputStr: string) => {
       const trimmed = inputStr.trim();
       const val = parseFloat(trimmed);
       if (isNaN(val) || trimmed === "") {
         return { resulting: currentScore, delta: 0, isValid: false, error: null };
+      }
+
+      // Reject negative input values — V must be >= 0 for every operation.
+      // Use SUBTRACT with a positive value to reduce a score.
+      if (val < 0) {
+        return {
+          resulting: currentScore,
+          delta: 0,
+          isValid: false,
+          error: "Input must be ≥ 0. Use SUBTRACT to reduce a score.",
+        };
       }
 
       // Enforce strict 2-decimal precision (prevents silent rounding)
@@ -229,8 +243,10 @@ export function ScoreControlManager({
           delta = val;
           break;
         case "SUBTRACT":
-          resulting = currentScore - val;
-          delta = -val;
+          // Zero-floor: clamp to 0 when penalty exceeds available score.
+          // Never reject — a penalty larger than current score simply zeros out.
+          resulting = Math.max(0, currentScore - val);
+          delta = resulting - currentScore; // actual clamped delta
           break;
         case "MULTIPLY":
           resulting = Math.round(currentScore * val * 100) / 100;
@@ -246,18 +262,9 @@ export function ScoreControlManager({
           break;
       }
 
-      if (!allowNegativeScores && resulting < 0) {
-        return {
-          resulting,
-          delta,
-          isValid: false,
-          error: "Negative scores are disabled",
-        };
-      }
-
       return { resulting, delta, isValid: true, error: null };
     },
-    [allowNegativeScores]
+    []
   );
 
   // Staged operations ready to commit
@@ -611,8 +618,9 @@ export function ScoreControlManager({
                       <div className="sm:col-span-5">
                         <input
                           type="number"
+                          min="0"
                           step="any"
-                          placeholder="Points (e.g. 500 or -250)"
+                          placeholder="Points value (e.g. 500)"
                           value={state.inputValue}
                           onChange={(e) =>
                             updateRow(team.id, {

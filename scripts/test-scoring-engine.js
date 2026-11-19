@@ -1,11 +1,12 @@
 // ====================================================================
 // CASINO ROYALE — SCORING ENGINE COMPLETE AUTOMATED TEST SUITE
+// Updated: migration 20261118020000 — zero-floor SUBTRACT, non-negative input
 // ====================================================================
 
 class MockScoringLedger {
-  constructor(startingScore = 0.0, allowNegative = false) {
+  constructor(startingScore = 0.0) {
     this.startingScore = startingScore;
-    this.allowNegative = allowNegative;
+    // allow_negative is DEPRECATED; zero-floor is unconditional for SUBTRACT.
     this.transactions = [];
     this.idempotencyRecords = new Map();
   }
@@ -51,6 +52,11 @@ class MockScoringLedger {
       const val = Number(op.input_value);
       if (isNaN(val)) throw new Error("Invalid numeric input: " + op.input_value);
 
+      // Reject negative input values (V must be >= 0)
+      if (val < 0) {
+        throw new Error("[22023] input_value must be non-negative (got " + val + "). Use SUBTRACT with a positive value to reduce a score.");
+      }
+
       // In-transaction previous overall score (reflects earlier ops in same batch)
       const currentDelta = tempTransactions
         .filter((t) => t.team_id === teamId)
@@ -64,8 +70,11 @@ class MockScoringLedger {
         resScore = Math.round((prevScore + val) * 100) / 100;
         delta = val;
       } else if (opType === "SUBTRACT") {
-        resScore = Math.round((prevScore - val) * 100) / 100;
-        delta = -val;
+        // Zero-floor: clamp to 0 when penalty exceeds available score.
+        // Never reject — a penalty larger than current score simply zeros out.
+        // delta = actual clamped change, not raw -val.
+        resScore = Math.max(0, Math.round((prevScore - val) * 100) / 100);
+        delta = Math.round((resScore - prevScore) * 100) / 100;
       } else if (opType === "MULTIPLY") {
         resScore = Math.round(prevScore * val * 100) / 100;
         delta = Math.round((resScore - prevScore) * 100) / 100;
@@ -78,10 +87,6 @@ class MockScoringLedger {
         delta = Math.round((val - prevScore) * 100) / 100;
       } else {
         throw new Error("Invalid operation type: " + opType);
-      }
-
-      if (!this.allowNegative && resScore < 0) {
-        throw new Error("Negative scores are not permitted for event (Team " + teamId + " resulting: " + resScore + ")");
       }
 
       const txRecord = {
@@ -141,11 +146,8 @@ class MockScoringLedger {
 
     const prevScore = this.getCurrentOverallScore(orig.team_id);
     const revDelta = -orig.points_delta;
-    const resScore = Math.round((prevScore + revDelta) * 100) / 100;
-
-    if (!this.allowNegative && resScore < 0) {
-      throw new Error("Cannot reverse transaction: resulting score would be negative");
-    }
+    // Zero-floor: clamp to 0 (matches the SQL GREATEST(0, ...) guard).
+    const resScore = Math.max(0, Math.round((prevScore + revDelta) * 100) / 100);
 
     const revTx = {
       id: "rev-" + Math.random().toString(36).substring(2, 9),
@@ -216,6 +218,68 @@ console.log("=== CASINO ROYALE SCORING REPAIR AUTOMATED TEST SUITE ===\n");
   assert("SET_SCORE 40 on 140 -> 40 (delta -100)", t5.transactions[0].resulting_score === 40 && t5.transactions[0].points_delta === -100);
 }
 
+// 1b. AUTHORITATIVE SUBTRACT ZERO-FLOOR TESTS (spec: R = MAX(0, P - V))
+{
+  // Example A: 15 - 10 = 5 (normal, no clamp)
+  const la = new MockScoringLedger(15.0, false);
+  const ta = la.recordScoreBatch("e1", "r1", "sub-a", [{ team_id: "teamA", operation_type: "SUBTRACT", input_value: 10 }]);
+  assert("SUBTRACT Example A: 15 - 10 = 5 (delta -10)", ta.transactions[0].resulting_score === 5 && ta.transactions[0].points_delta === -10);
+
+  // Example B: 5 - 10 → clamp to 0 (delta = -5, not -10)
+  const lb = new MockScoringLedger(5.0, false);
+  const tb = lb.recordScoreBatch("e1", "r1", "sub-b", [{ team_id: "teamA", operation_type: "SUBTRACT", input_value: 10 }]);
+  assert("SUBTRACT Example B: 5 - 10 clamps to 0 (delta -5)", tb.transactions[0].resulting_score === 0 && tb.transactions[0].points_delta === -5);
+
+  // Example C: 0 - 10 → clamp to 0 (delta = 0)
+  const lc = new MockScoringLedger(0.0, false);
+  const tc = lc.recordScoreBatch("e1", "r1", "sub-c", [{ team_id: "teamA", operation_type: "SUBTRACT", input_value: 10 }]);
+  assert("SUBTRACT Example C: 0 - 10 clamps to 0 (delta 0)", tc.transactions[0].resulting_score === 0 && tc.transactions[0].points_delta === 0);
+
+  // Penalty exceeds score: must succeed, not reject
+  const ld = new MockScoringLedger(3.0, false);
+  let penaltySucceeded = false;
+  try {
+    ld.recordScoreBatch("e1", "r1", "sub-d", [{ team_id: "teamA", operation_type: "SUBTRACT", input_value: 1000 }]);
+    penaltySucceeded = true;
+  } catch {
+    // Expected to succeed under zero-floor policy
+  }
+  assert("SUBTRACT: penalty > current score succeeds (not rejected)", penaltySucceeded);
+  assert("SUBTRACT: score after large penalty is 0", ld.getCurrentOverallScore("teamA") === 0);
+
+  // Negative input is rejected (input_value must be >= 0)
+  const le = new MockScoringLedger(100.0, false);
+  let negInputRejected = false;
+  try {
+    le.recordScoreBatch("e1", "r1", "sub-e", [{ team_id: "teamA", operation_type: "ADD", input_value: -10 }]);
+  } catch (err) {
+    negInputRejected = String(err).includes("non-negative");
+  }
+  assert("Negative input_value is rejected with non-negative message", negInputRejected);
+
+  // SET_SCORE 30 → 0: delta = -30
+  const lf = new MockScoringLedger(30.0, false);
+  const tf = lf.recordScoreBatch("e1", "r1", "set-zero", [{ team_id: "teamA", operation_type: "SET_SCORE", input_value: 0 }]);
+  assert("SET_SCORE 0 on 30 -> 0 (delta -30)", tf.transactions[0].resulting_score === 0 && tf.transactions[0].points_delta === -30);
+
+  // Sequential operations using prior clamped result
+  const lg = new MockScoringLedger(5.0, false);
+  lg.recordScoreBatch("e1", "r1", "seq-1", [{ team_id: "teamA", operation_type: "SUBTRACT", input_value: 10 }]);
+  // Score is now 0
+  assert("Sequential: score is 0 after clamped SUBTRACT", lg.getCurrentOverallScore("teamA") === 0);
+  lg.recordScoreBatch("e1", "r1", "seq-2", [{ team_id: "teamA", operation_type: "ADD", input_value: 20 }]);
+  assert("Sequential: ADD 20 after zero-floor gives 20", lg.getCurrentOverallScore("teamA") === 20);
+
+  // Reversal of a clamped SUBTRACT: team at 5, SUBTRACT 10 → 0 (delta=-5), reverse → 0 + 5 = 5
+  const lh = new MockScoringLedger(5.0, false);
+  const thBatch = lh.recordScoreBatch("e1", "r1", "clamp-rev", [{ team_id: "teamA", operation_type: "SUBTRACT", input_value: 10 }]);
+  assert("Clamped SUBTRACT: delta = -5 (not -10)", thBatch.transactions[0].points_delta === -5);
+  const revResult = lh.reverseScoreTransaction(thBatch.transactions[0].id, "Reversal test");
+  assert("Reversal of clamped SUBTRACT: rev_delta = +5", revResult.points_delta === 5);
+  assert("Reversal of clamped SUBTRACT: resulting score = 5", revResult.resulting_score === 5);
+  assert("Score after reversing clamped SUBTRACT = 5", lh.getCurrentOverallScore("teamA") === 5);
+}
+
 // 2. SET_SCORE ROUND TRIPS
 {
   const ledger = new MockScoringLedger(140.0, false);
@@ -252,7 +316,9 @@ console.log("=== CASINO ROYALE SCORING REPAIR AUTOMATED TEST SUITE ===\n");
   assert("Leaderboard overall matches 225", ledger.getCurrentOverallScore("teamA") === 225);
 }
 
-// 4. DIVISION BY ZERO & NEGATIVE CHECKS
+// 4. DIVISION BY ZERO & ZERO-FLOOR SUBTRACT BOUNDARY
+// (allow_negative_scores is DEPRECATED as of migration 20261118020000.
+//  SUBTRACT always clamps to 0 — zero-floor is unconditional.)
 {
   const ledger = new MockScoringLedger(140.0, false);
   let divZeroCaught = false;
@@ -264,18 +330,12 @@ console.log("=== CASINO ROYALE SCORING REPAIR AUTOMATED TEST SUITE ===\n");
   assert("Division by zero throws exception and rejects batch", divZeroCaught);
   assert("Ledger unchanged after division by zero rejection", ledger.transactions.length === 0);
 
-  let negBlocked = false;
-  try {
-    ledger.recordScoreBatch("e1", "r1", "k11", [{ team_id: "teamA", operation_type: "SUBTRACT", input_value: 200 }]);
-  } catch {
-    negBlocked = true;
-  }
-  assert("Negative score blocked when allow_negative = false", negBlocked);
-  assert("Ledger unchanged after negative rejection", ledger.transactions.length === 0);
-
-  const negAllowedLedger = new MockScoringLedger(140.0, true);
-  const negOk = negAllowedLedger.recordScoreBatch("e1", "r1", "k12", [{ team_id: "teamA", operation_type: "SUBTRACT", input_value: 200 }]);
-  assert("Negative score permitted when allow_negative = true (result = -60)", negOk.transactions[0].resulting_score === -60);
+  // SUBTRACT 200 on score 140: zero-floor clamps to 0 (delta = -140), never rejects.
+  const r = ledger.recordScoreBatch("e1", "r1", "k11", [{ team_id: "teamA", operation_type: "SUBTRACT", input_value: 200 }]);
+  assert("SUBTRACT beyond score clamps to 0 (zero-floor, not rejected)", r.transactions[0].resulting_score === 0);
+  assert("Clamped SUBTRACT: delta = -140 (actual change, not -200)", r.transactions[0].points_delta === -140);
+  assert("Ledger has 1 transaction after clamped SUBTRACT", ledger.transactions.length === 1);
+  assert("Score is 0 after clamped SUBTRACT", ledger.getCurrentOverallScore("teamA") === 0);
 }
 
 // 5. DECIMALS

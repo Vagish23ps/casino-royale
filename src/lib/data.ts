@@ -189,10 +189,14 @@ export async function getAdminDashboardData(): Promise<AdminDashboardData> {
         const scoreMap = new Map<string, number>();
         teams.forEach((t) => scoreMap.set(t.id, startingScore));
 
-        // Get all transactions for teams
-        const { data: allTxs } = await supabase
+        // Get all transactions for teams (scoped to active event)
+        let txQuery = supabase
           .from("score_transactions")
           .select("team_id, points_delta");
+        if (eventId) {
+          txQuery = txQuery.eq("event_id", eventId);
+        }
+        const { data: allTxs } = await txQuery;
 
         if (allTxs) {
           allTxs.forEach((tx: { team_id: string; points_delta: number | null }) => {
@@ -282,20 +286,72 @@ export async function getTeamsManagementData() {
 
     if (!err2 && deleted) deletedTeams = deleted as Team[];
 
+    // Fetch active event & settings for starting_score
+    let startingScore = 0.0;
+    let eventId: string | null = null;
+    try {
+      const { data: ev } = await supabase
+        .from("events")
+        .select("id")
+        .is("deleted_at", null)
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (ev?.id) {
+        eventId = ev.id;
+        const { data: st } = await supabase
+          .from("event_settings")
+          .select("starting_score")
+          .eq("event_id", ev.id)
+          .maybeSingle();
+        if (st?.starting_score !== undefined && st?.starting_score !== null) {
+          startingScore = Number(st.starting_score);
+        }
+      }
+    } catch {
+      // Handled gracefully
+    }
+
+    // Fetch authoritative leaderboard scores from view
+    const leaderboardScores = new Map<string, number>();
+    try {
+      let lbQuery = supabase.from("v_public_overall_leaderboard").select("team_id, total_score");
+      if (eventId) {
+        lbQuery = lbQuery.eq("event_id", eventId);
+      }
+      const { data: lbData } = await lbQuery;
+      if (lbData) {
+        lbData.forEach((row: { team_id?: string; total_score?: number }) => {
+          if (row.team_id) {
+            leaderboardScores.set(String(row.team_id), Number(row.total_score || 0));
+          }
+        });
+      }
+    } catch {
+      // Handled gracefully
+    }
+
     // Fetch rounds to map round scores
-    const { data: rounds } = await supabase
+    let rQuery = supabase
       .from("rounds")
       .select("id, name, round_number")
-      .order("round_number", { ascending: true });
+      .is("deleted_at", null);
+    if (eventId) {
+      rQuery = rQuery.eq("event_id", eventId);
+    }
+    const { data: rounds } = await rQuery.order("round_number", { ascending: true });
 
     const roundList = rounds || [];
 
-    // Fetch all transactions to compute scores
-    const { data: txs } = await supabase
+    // Fetch all transactions to compute scores (scoped to active event)
+    let txQuery = supabase
       .from("score_transactions")
       .select("team_id, round_id, points_delta, operation_type, reversal_of_transaction_id");
+    if (eventId) {
+      txQuery = txQuery.eq("event_id", eventId);
+    }
+    const { data: txs } = await txQuery;
 
-    const startingScore = 0.0;
     const allTeams = [...activeTeams, ...deletedTeams];
 
     allTeams.forEach((t) => {
@@ -330,8 +386,13 @@ export async function getTeamsManagementData() {
         };
       });
 
+      // Authoritative score from view if available, otherwise starting_score + totalDelta
+      const authoritativeScore = leaderboardScores.has(t.id)
+        ? (leaderboardScores.get(t.id) ?? startingScore)
+        : (startingScore + totalDelta);
+
       teamScores[t.id] = {
-        total: startingScore + totalDelta,
+        total: authoritativeScore,
         roundScores: rScores,
       };
     });
@@ -399,11 +460,22 @@ export async function getScoreControlData() {
   let errorMsg: string | null = null;
 
   try {
-    // 1. Get settings
+    // 0. Determine active event ID first so all subsequent queries are scoped to it
+    const { data: evData } = await supabase
+      .from("events")
+      .select("id, status")
+      .is("deleted_at", null)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    const eventId: string | null = evData?.id ?? null;
+
+    // 1. Get settings (scoped to active event)
     const { data: settings } = await supabase
       .from("event_settings")
       .select("starting_score, allow_negative_scores")
-      .limit(1)
+      .eq("event_id", eventId ?? "")
       .maybeSingle();
 
     if (settings?.starting_score) {
@@ -413,36 +485,63 @@ export async function getScoreControlData() {
       allowNegativeScores = Boolean(settings.allow_negative_scores);
     }
 
-    // 2. Get active rounds
-    const { data: rData, error: rErr } = await supabase
-      .from("rounds")
-      .select("*")
-      .is("deleted_at", null)
-      .order("round_number", { ascending: true });
+    // 2. Get active rounds (scoped to active event)
+    let rQuery = supabase.from("rounds").select("*").is("deleted_at", null);
+    if (eventId) rQuery = rQuery.eq("event_id", eventId);
+    const { data: rData, error: rErr } = await rQuery.order("round_number", { ascending: true });
 
     if (rErr) errorMsg = rErr.message;
     else if (rData) rounds = rData as Round[];
 
-    // 3. Get active teams
-    const { data: tData, error: tErr } = await supabase
-      .from("teams")
-      .select("*")
-      .is("deleted_at", null)
-      .order("name", { ascending: true });
+    // 3. Get active teams (scoped to active event)
+    let tQuery = supabase.from("teams").select("*").is("deleted_at", null);
+    if (eventId) tQuery = tQuery.eq("event_id", eventId);
+    const { data: tData, error: tErr } = await tQuery.order("name", { ascending: true });
 
     if (tErr) errorMsg = errorMsg || tErr.message;
     else if (tData) teams = tData as Team[];
 
-    // 4. Calculate current score per team
-    const { data: txs } = await supabase
-      .from("score_transactions")
-      .select("team_id, points_delta");
+    // 4. Calculate current score per team.
+    // Query authoritative leaderboard view first, scoped to event_id.
+    if (eventId) {
+      let viewMatched = false;
+      try {
+        const { data: viewData, error: viewErr } = await supabase
+          .from("v_public_overall_leaderboard")
+          .select("team_id, total_score")
+          .eq("event_id", eventId);
 
-    teams.forEach((t) => {
-      const matching = (txs || []).filter((tx) => tx.team_id === t.id);
-      const totalDelta = matching.reduce((sum, tx) => sum + Number(tx.points_delta || 0), 0);
-      teamScores[t.id] = startingScore + totalDelta;
-    });
+        if (!viewErr && viewData && viewData.length > 0) {
+          const scoreMap = new Map<string, number>();
+          viewData.forEach((row: { team_id?: string; total_score?: number }) => {
+            if (row.team_id) scoreMap.set(String(row.team_id), Number(row.total_score || 0));
+          });
+          teams.forEach((t) => {
+            teamScores[t.id] = scoreMap.has(t.id) ? (scoreMap.get(t.id) ?? startingScore) : startingScore;
+          });
+          viewMatched = true;
+        }
+      } catch {
+        // Fallback to score_transactions
+      }
+
+      if (!viewMatched) {
+        const { data: txs } = await supabase
+          .from("score_transactions")
+          .select("team_id, points_delta")
+          .eq("event_id", eventId);
+
+        teams.forEach((t) => {
+          const matching = (txs || []).filter((tx) => tx.team_id === t.id);
+          const totalDelta = matching.reduce((sum, tx) => sum + Number(tx.points_delta || 0), 0);
+          teamScores[t.id] = startingScore + totalDelta;
+        });
+      }
+    } else {
+      teams.forEach((t) => {
+        teamScores[t.id] = startingScore;
+      });
+    }
   } catch (e: unknown) {
     errorMsg = e instanceof Error ? e.message : "Failed to load score control data";
   }
@@ -528,11 +627,16 @@ export async function getPublicScoreboardData() {
       if (rnd) activeRound = rnd as Round;
     }
 
-    // Try view
-    const { data: viewData, error: viewErr } = await supabase
+    // Try view (scoped to active event to prevent cross-event score drift)
+    let viewQuery = supabase
       .from("v_public_overall_leaderboard")
-      .select("*")
-      .order("rank", { ascending: true });
+      .select("*");
+
+    if (event?.id) {
+      viewQuery = viewQuery.eq("event_id", event.id);
+    }
+
+    const { data: viewData, error: viewErr } = await viewQuery.order("rank", { ascending: true });
 
     if (!viewErr && viewData && viewData.length > 0) {
       leaderboard = (viewData as Record<string, unknown>[]).map((d) => ({
@@ -545,10 +649,16 @@ export async function getPublicScoreboardData() {
       }));
     } else {
       // Fallback: load active teams and starting scores without accessing restricted transaction ledger
-      const { data: tData } = await supabase
+      let tQuery = supabase
         .from("teams")
         .select("*")
         .is("deleted_at", null);
+
+      if (event?.id) {
+        tQuery = tQuery.eq("event_id", event.id);
+      }
+
+      const { data: tData } = await tQuery;
 
       if (tData && tData.length > 0) {
         const startingScore = Number(settings?.starting_score || 0.0);
