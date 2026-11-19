@@ -497,6 +497,376 @@ it("Page refresh simulation: cold mount matches database view with zero drift", 
   assert.strictEqual(refreshedSb.showCurtainIntro, false, "Initial mount must not play phantom animations");
 });
 
+// --- TEST GROUP 8: DYNAMIC ALIGNMENT FOR TEAMS BELOW 3RD PLACE ---
+console.log("\n--- GROUP 8: DYNAMIC ALIGNMENT FOR TEAMS BELOW 3RD PLACE ---");
+
+function getRestContainerClass(count) {
+  if (count === 1) return "flex justify-center w-full";
+  if (count >= 2 && count <= 5) return "grid grid-cols-1 sm:grid-cols-2 gap-2.5 sm:gap-3.5 max-w-4xl mx-auto w-full";
+  return "grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2 sm:gap-2.5 max-h-48 sm:max-h-60 lg:max-h-68 overflow-y-auto admin-scroll pr-1.5 w-full";
+}
+
+function getRestItemClass(index, count) {
+  if (count === 1) return "w-full max-w-md sm:max-w-lg";
+  if (count === 3 && index === 2) return "sm:col-span-2 sm:max-w-md sm:mx-auto w-full";
+  if (count === 5 && index === 4) return "sm:col-span-2 sm:max-w-md sm:mx-auto w-full";
+  if (count > 5 && count % 3 === 1 && index === count - 1) return "lg:col-span-3 lg:max-w-md lg:mx-auto w-full";
+  return "w-full";
+}
+
+it("4 total teams (1 lower-ranked team): centred horizontally", () => {
+  const count = 1;
+  const container = getRestContainerClass(count);
+  const item = getRestItemClass(0, count);
+
+  assert.ok(container.includes("flex justify-center"), "Container must be flex justify-center");
+  assert.ok(item.includes("max-w-md"), "Item must be centered with max-w");
+});
+
+it("5 total teams (2 lower-ranked teams): one left, one right in 2-column grid", () => {
+  const count = 2;
+  const container = getRestContainerClass(count);
+  const item1 = getRestItemClass(0, count);
+  const item2 = getRestItemClass(1, count);
+
+  assert.ok(container.includes("grid-cols-1 sm:grid-cols-2"), "Container must be 2 columns");
+  assert.strictEqual(item1, "w-full");
+  assert.strictEqual(item2, "w-full");
+});
+
+it("6 total teams (3 lower-ranked teams): 2 on first row, third centred on second row", () => {
+  const count = 3;
+  const container = getRestContainerClass(count);
+  const item1 = getRestItemClass(0, count);
+  const item2 = getRestItemClass(1, count);
+  const item3 = getRestItemClass(2, count);
+
+  assert.ok(container.includes("grid-cols-1 sm:grid-cols-2"), "Container must be 2 columns");
+  assert.strictEqual(item1, "w-full", "First item spans 1 col");
+  assert.strictEqual(item2, "w-full", "Second item spans 1 col");
+  assert.ok(item3.includes("sm:col-span-2") && item3.includes("sm:mx-auto"), "Third item spans 2 cols and is centred");
+});
+
+it("7 & 8 total teams (4 and 5 lower-ranked teams): balanced symmetrical layout", () => {
+  // 7 total teams (4 rest): 2 rows of 2
+  const count4 = 4;
+  assert.ok(getRestContainerClass(count4).includes("sm:grid-cols-2"));
+
+  // 8 total teams (5 rest): 2 rows of 2 + 1 centred on third row
+  const count5 = 5;
+  const item5 = getRestItemClass(4, count5);
+  assert.ok(item5.includes("sm:col-span-2") && item5.includes("sm:mx-auto"));
+});
+
+it("9+ total teams: 3-column responsive grid with scrollbar", () => {
+  const count = 6;
+  const container = getRestContainerClass(count);
+  assert.ok(container.includes("lg:grid-cols-3") && container.includes("overflow-y-auto"));
+});
+
+// --- TEST GROUP 9: RANK SHUFFLE ANIMATION & IDENTITY BINDING ---
+console.log("\n--- GROUP 9: RANK SHUFFLE ANIMATION & IDENTITY BINDING ---");
+
+it("Score update WITHOUT ranking change does NOT trigger rank shuffle animation", () => {
+  const sb = new ScoreboardModel("event-1", [
+    { team_id: "team-1", team_name: "Royals", total_score: 200, rank: 1 },
+    { team_id: "team-2", team_name: "Aces", total_score: 100, rank: 2 },
+  ]);
+
+  // Leader gains 20 points, remains rank 1
+  sb.handleBroadcastMessage({
+    payload: {
+      eventId: "event-1",
+      updated_scores: { "team-1": 220 },
+      timestamp: 5000,
+    },
+  });
+
+  assert.strictEqual(sb.getTeamScore("team-1"), 220);
+  assert.strictEqual(sb.getTeamRank("team-1"), 1);
+  assert.strictEqual(sb.getTeamRank("team-2"), 2);
+  assert.deepStrictEqual(sb.rankShifts, {}, "No rank shifts should occur when ranking order is unchanged");
+});
+
+it("Score update WITH ranking change triggers shuffle with correct directions", () => {
+  const sb = new ScoreboardModel("event-1", [
+    { team_id: "team-1", team_name: "Royals", total_score: 150, rank: 1 },
+    { team_id: "team-2", team_name: "Aces", total_score: 140, rank: 2 },
+  ]);
+
+  // Aces gains 30 points -> 170, overtaking Royals (150)
+  sb.handleBroadcastMessage({
+    payload: {
+      eventId: "event-1",
+      updated_scores: { "team-2": 170 },
+      timestamp: 5001,
+    },
+  });
+
+  assert.strictEqual(sb.getTeamScore("team-2"), 170);
+  assert.strictEqual(sb.getTeamRank("team-2"), 1, "Aces takes rank 1");
+  assert.strictEqual(sb.getTeamRank("team-1"), 2, "Royals drops to rank 2");
+
+  assert.strictEqual(sb.rankShifts["team-2"]?.direction, "up", "Aces moved UP");
+  assert.strictEqual(sb.rankShifts["team-1"]?.direction, "down", "Royals moved DOWN");
+});
+
+it("Team name and score remain strictly associated throughout transition", () => {
+  const sb = new ScoreboardModel("event-1", [
+    { team_id: "team-1", team_name: "Royals", total_score: 150, rank: 1 },
+    { team_id: "team-2", team_name: "Aces", total_score: 140, rank: 2 },
+  ]);
+
+  sb.handleBroadcastMessage({
+    payload: {
+      eventId: "event-1",
+      updated_scores: { "team-2": 170 },
+      timestamp: 5002,
+    },
+  });
+
+  const leader = sb.leaderboard[0];
+  const second = sb.leaderboard[1];
+
+  assert.strictEqual(leader.team_name, "Aces");
+  assert.strictEqual(leader.total_score, 170, "Aces must be paired with 170");
+
+  assert.strictEqual(second.team_name, "Royals");
+  assert.strictEqual(second.total_score, 150, "Royals must be paired with 150");
+});
+
+// --- TEST GROUP 10: SEQUENTIAL SCORE LOCKING & PHYSICAL NAMEPLATE SHUFFLE ---
+console.log("\n--- GROUP 10: SEQUENTIAL SCORE LOCKING & PHYSICAL NAMEPLATE SHUFFLE ---");
+
+class SequentialScoreboardSimulator {
+  constructor(initialTeams) {
+    this.displayedSlots = initialTeams.map((t, idx) => ({ ...t, currentSlot: idx + 1 }));
+    this.phase = "idle";
+    this.settledReelCount = 0;
+    this.affectedTeams = [];
+    this.pendingRanked = null;
+    this.rankShifts = {};
+    this.nameplatePositions = {};
+    this.indicatorVisible = false;
+    this.soundLog = [];
+
+    this.displayedSlots.forEach((t) => {
+      this.nameplatePositions[t.team_id] = t.currentSlot;
+    });
+  }
+
+  onScoreUpdate(updatedScores) {
+    const affected = [];
+    this.displayedSlots = this.displayedSlots.map((team) => {
+      if (updatedScores[team.team_id] !== undefined && updatedScores[team.team_id] !== team.total_score) {
+        affected.push(team.team_id);
+        return { ...team, total_score: updatedScores[team.team_id] };
+      }
+      return team;
+    });
+
+    if (affected.length === 0) return { isDuplicate: true };
+
+    const sorted = [...this.displayedSlots].sort((a, b) => b.total_score - a.total_score);
+    this.pendingRanked = sorted.map((t, idx) => ({ ...t, rank: idx + 1 }));
+
+    this.phase = "score_rolling";
+    this.affectedTeams = affected;
+    this.settledReelCount = 0;
+    this.indicatorVisible = false;
+    this.soundLog.push("startSlotRoll");
+
+    return { affected, phase: this.phase };
+  }
+
+  onDigitLock(teamId) {
+    this.soundLog.push(`digitLock:${teamId}`);
+  }
+
+  onTeamReelComplete() {
+    this.settledReelCount++;
+    if (this.settledReelCount >= this.affectedTeams.length) {
+      this.phase = "digits_locked";
+      this.soundLog.push("allReelsSettled");
+      this.evaluateRankChange();
+    }
+  }
+
+  evaluateRankChange() {
+    let rankOrderChanged = false;
+    const newShifts = {};
+
+    this.displayedSlots.forEach((team, oldIdx) => {
+      const newIdx = this.pendingRanked.findIndex((t) => t.team_id === team.team_id);
+      const oldRank = oldIdx + 1;
+      const newRank = newIdx + 1;
+      if (oldRank !== newRank) {
+        rankOrderChanged = true;
+        newShifts[team.team_id] = {
+          from: oldRank,
+          to: newRank,
+          direction: newRank < oldRank ? "up" : "down",
+        };
+      }
+    });
+
+    if (!rankOrderChanged) {
+      this.phase = "settled";
+      this.rankShifts = {};
+      return;
+    }
+
+    this.phase = "nameplate_shuffling";
+    this.soundLog.push("playNameplateShuffle");
+    this.soundLog.push("playScoreReveal");
+
+    this.displayedSlots = this.pendingRanked.map((t, idx) => ({ ...t, currentSlot: idx + 1 }));
+    this.displayedSlots.forEach((t) => {
+      this.nameplatePositions[t.team_id] = t.currentSlot;
+    });
+
+    this.rankShifts = newShifts;
+  }
+
+  onNameplateShuffleTransitionEnd() {
+    this.phase = "settled";
+    this.indicatorVisible = true;
+  }
+}
+
+it("Score changes without ranking changes: score reels roll, settle, zero nameplate shuffle", () => {
+  const sim = new SequentialScoreboardSimulator([
+    { team_id: "t1", team_name: "Royals", total_score: 200 },
+    { team_id: "t2", team_name: "Aces", total_score: 150 },
+  ]);
+
+  // Royals gain 20 points -> 220, remains rank 1
+  sim.onScoreUpdate({ t1: 220 });
+  assert.strictEqual(sim.phase, "score_rolling");
+  assert.strictEqual(sim.nameplatePositions["t1"], 1, "Royals remains in slot 1 while rolling");
+  assert.strictEqual(sim.nameplatePositions["t2"], 2, "Aces remains in slot 2 while rolling");
+
+  // Digits lock
+  sim.onDigitLock("t1");
+  sim.onTeamReelComplete("t1");
+
+  assert.strictEqual(sim.phase, "settled");
+  assert.deepStrictEqual(sim.rankShifts, {});
+  assert.strictEqual(sim.soundLog.includes("playNameplateShuffle"), false, "No nameplate shuffle sound when rank order unchanged");
+  assert.strictEqual(sim.nameplatePositions["t1"], 1);
+  assert.strictEqual(sim.nameplatePositions["t2"], 2);
+});
+
+it("Two teams exchanging positions: Rank 2 overtakes Rank 1 via physical nameplate exchange", () => {
+  const sim = new SequentialScoreboardSimulator([
+    { team_id: "t1", team_name: "Royals", total_score: 200 },
+    { team_id: "t2", team_name: "Aces", total_score: 150 },
+  ]);
+
+  // Aces gains 100 points -> 250, overtaking Royals (200)
+  sim.onScoreUpdate({ t2: 250 });
+
+  // During score rolling: names MUST stay in current slots!
+  assert.strictEqual(sim.phase, "score_rolling");
+  assert.strictEqual(sim.nameplatePositions["t1"], 1, "Royals nameplate stays in slot 1 while score rolls");
+  assert.strictEqual(sim.nameplatePositions["t2"], 2, "Aces nameplate stays in slot 2 while score rolls");
+
+  // Digits lock
+  sim.onDigitLock("t2");
+  sim.onTeamReelComplete("t2");
+
+  // Immediately after reels settle: nameplate shuffle starts!
+  assert.strictEqual(sim.phase, "nameplate_shuffling");
+  assert.strictEqual(sim.nameplatePositions["t2"], 1, "Aces nameplate physically moves to slot 1");
+  assert.strictEqual(sim.nameplatePositions["t1"], 2, "Royals nameplate physically moves to slot 2");
+
+  assert.strictEqual(sim.rankShifts["t2"]?.direction, "up");
+  assert.strictEqual(sim.rankShifts["t1"]?.direction, "down");
+
+  // Transition ends: rank change indicator becomes visible
+  assert.strictEqual(sim.indicatorVisible, false, "Indicators hidden during slide");
+  sim.onNameplateShuffleTransitionEnd();
+  assert.strictEqual(sim.indicatorVisible, true, "Indicators visible after shuffle completes");
+});
+
+it("One team overtaking multiple teams: Rank 4 leaps to Rank 1", () => {
+  const sim = new SequentialScoreboardSimulator([
+    { team_id: "t1", team_name: "T1", total_score: 300 },
+    { team_id: "t2", team_name: "T2", total_score: 250 },
+    { team_id: "t3", team_name: "T3", total_score: 200 },
+    { team_id: "t4", team_name: "T4", total_score: 100 },
+  ]);
+
+  // T4 scores 350 -> leaps to Rank 1!
+  sim.onScoreUpdate({ t4: 450 });
+  assert.strictEqual(sim.phase, "score_rolling");
+  assert.strictEqual(sim.nameplatePositions["t4"], 4, "T4 stays in slot 4 during roll");
+
+  sim.onDigitLock("t4");
+  sim.onTeamReelComplete("t4");
+
+  assert.strictEqual(sim.phase, "nameplate_shuffling");
+  assert.strictEqual(sim.nameplatePositions["t4"], 1, "T4 nameplate moves to slot 1");
+  assert.strictEqual(sim.nameplatePositions["t1"], 2, "T1 nameplate drops to slot 2");
+  assert.strictEqual(sim.nameplatePositions["t2"], 3, "T2 nameplate drops to slot 3");
+  assert.strictEqual(sim.nameplatePositions["t3"], 4, "T3 nameplate drops to slot 4");
+
+  assert.strictEqual(sim.rankShifts["t4"]?.direction, "up");
+  assert.strictEqual(sim.rankShifts["t4"]?.from, 4);
+  assert.strictEqual(sim.rankShifts["t4"]?.to, 1);
+});
+
+it("Rapid consecutive score changes: retarget in-flight without desynchronisation", () => {
+  const sim = new SequentialScoreboardSimulator([
+    { team_id: "t1", team_name: "T1", total_score: 100 },
+    { team_id: "t2", team_name: "T2", total_score: 80 },
+  ]);
+
+  // First update: t2 -> 110 (overtakes t1)
+  sim.onScoreUpdate({ t2: 110 });
+  assert.strictEqual(sim.phase, "score_rolling");
+
+  // Before reels finish settling, a rapid second update arrives: t1 -> 150 (takes back lead)
+  sim.onScoreUpdate({ t1: 150 });
+  assert.strictEqual(sim.phase, "score_rolling");
+
+  // Both reels settle
+  sim.onDigitLock("t2");
+  sim.onTeamReelComplete("t2");
+  sim.onDigitLock("t1");
+  sim.onTeamReelComplete("t1");
+
+  // T1 has 150, T2 has 110 -> T1 is still #1, T2 is still #2
+  assert.strictEqual(sim.displayedSlots[0].team_id, "t1");
+  assert.strictEqual(sim.displayedSlots[0].total_score, 150);
+  assert.strictEqual(sim.displayedSlots[1].team_id, "t2");
+  assert.strictEqual(sim.displayedSlots[1].total_score, 110);
+});
+
+it("Strict sequential order: roll -> digit locks -> all settled -> nameplate shuffle -> indicators visible", () => {
+  const sim = new SequentialScoreboardSimulator([
+    { team_id: "t1", team_name: "T1", total_score: 100 },
+    { team_id: "t2", team_name: "T2", total_score: 90 },
+  ]);
+
+  sim.onScoreUpdate({ t2: 120 });
+  sim.onDigitLock("t2");
+  sim.onTeamReelComplete("t2");
+  sim.onNameplateShuffleTransitionEnd();
+
+  // Validate sound sequence strictly
+  const startRollIdx = sim.soundLog.indexOf("startSlotRoll");
+  const digitLockIdx = sim.soundLog.indexOf("digitLock:t2");
+  const allSettledIdx = sim.soundLog.indexOf("allReelsSettled");
+  const shuffleSoundIdx = sim.soundLog.indexOf("playNameplateShuffle");
+  const revealChimeIdx = sim.soundLog.indexOf("playScoreReveal");
+
+  assert.ok(startRollIdx < digitLockIdx, "Reel sound precedes digit lock");
+  assert.ok(digitLockIdx < allSettledIdx, "Digit lock precedes all-settled completion");
+  assert.ok(allSettledIdx < shuffleSoundIdx, "All reels settled precedes nameplate shuffle sound");
+  assert.ok(shuffleSoundIdx <= revealChimeIdx, "Shuffle sound plays at start of shuffle");
+});
+
 console.log("\n=============================================================");
 console.log(`SUMMARY: ${passed} / ${passed + failed} tests passed cleanly!`);
 console.log("=============================================================\n");

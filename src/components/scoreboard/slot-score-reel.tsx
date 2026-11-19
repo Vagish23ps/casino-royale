@@ -12,6 +12,7 @@ export interface SlotScoreReelProps {
   variant?: "champion" | "silver" | "bronze" | "standard";
   className?: string;
   showDelta?: boolean;
+  onSettled?: () => void;
 }
 
 // Exactly 10 digits per reel strip
@@ -32,23 +33,45 @@ function SingleDigitReel({
   variant,
   onSettled,
 }: SingleDigitReelProps) {
-  const [hasSettled, setHasSettled] = useState(false);
+  const [isSettling, setIsSettling] = useState(false);
+  const [isSettled, setIsSettled] = useState(false);
+  const [prevSpinning, setPrevSpinning] = useState(isSpinning);
+
+  if (isSpinning !== prevSpinning) {
+    setPrevSpinning(isSpinning);
+    if (isSpinning) {
+      setIsSettling(false);
+      setIsSettled(false);
+    }
+  }
+
+  const settleDurationMs = 420;
 
   useEffect(() => {
     if (!isSpinning) {
       return;
     }
 
-    const timer = setTimeout(() => {
-      setHasSettled(true);
-      casinoSound.playSlotReelLock();
-      onSettled?.();
+    let lockTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const settleTimer = setTimeout(() => {
+      setIsSettling(true);
+
+      lockTimer = setTimeout(() => {
+        setIsSettled(true);
+        casinoSound.playSlotReelLock();
+        onSettled?.();
+      }, settleDurationMs);
     }, settleDelayMs);
 
-    return () => clearTimeout(timer);
-  }, [isSpinning, settleDelayMs, onSettled]);
+    return () => {
+      clearTimeout(settleTimer);
+      if (lockTimer) clearTimeout(lockTimer);
+    };
+  }, [isSpinning, settleDelayMs, targetDigit, onSettled]);
 
-  const isLocked = !isSpinning || hasSettled;
+  const isLocked = !isSpinning || isSettling || isSettled;
+  const isFastSpinning = isSpinning && !isSettling && !isSettled;
 
   // Viewport dimensions by variant
   const cellWidth = {
@@ -87,14 +110,15 @@ function SingleDigitReel({
       <div
         className={cn(
           "absolute inset-x-0 top-0 flex flex-col items-center",
-          !isLocked && "animate-slot-spin-fast"
+          isFastSpinning && "animate-slot-spin-fast"
         )}
         style={{
           height: "100%", // Exactly 1 viewport height
           transform: isLocked ? `translateY(-${targetDigit * 100}%)` : undefined,
-          transition: isLocked
-            ? "transform 0.65s cubic-bezier(0.18, 1.35, 0.45, 1)"
-            : "none",
+          transition:
+            isSettling && !isSettled
+              ? `transform ${settleDurationMs}ms cubic-bezier(0.16, 1, 0.3, 1)`
+              : "none",
         }}
       >
         {DIGITS.map((d) => (
@@ -122,6 +146,7 @@ export function SlotScoreReel({
   variant = "standard",
   className,
   showDelta = true,
+  onSettled,
 }: SlotScoreReelProps) {
   const [windowFlash, setWindowFlash] = useState(false);
 
@@ -146,13 +171,12 @@ export function SlotScoreReel({
       return;
     }
 
-    // Schedule flash after the last digit locks
-    const lastDigitDelay = staggerDelay + (digitIndices.length - 1) * 320;
+    // Schedule subtle bezel highlight right after the last digit locks
+    const lastDigitDelay = staggerDelay + (digitIndices.length - 1) * 220 + 420;
     const flashTimer = setTimeout(() => {
       setWindowFlash(true);
-      casinoSound.playScoreReveal(true);
-      setTimeout(() => setWindowFlash(false), 1400);
-    }, lastDigitDelay + 250);
+      setTimeout(() => setWindowFlash(false), 1200);
+    }, lastDigitDelay + 50);
 
     return () => clearTimeout(flashTimer);
   }, [isSpinning, staggerDelay, digitIndices.length]);
@@ -249,14 +273,16 @@ export function SlotScoreReel({
           const digitVal = Number(char);
           const thisDigitOrder = currentDigitCount;
           currentDigitCount++;
+          const isLastDigit = thisDigitOrder === digitIndices.length - 1;
 
           return (
             <SingleDigitReel
               key={idx}
               targetDigit={digitVal}
               isSpinning={isSpinning}
-              settleDelayMs={staggerDelay + thisDigitOrder * 320}
+              settleDelayMs={staggerDelay + thisDigitOrder * 220}
               variant={variant}
+              onSettled={isLastDigit ? onSettled : undefined}
             />
           );
         })}

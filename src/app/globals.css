@@ -748,6 +748,47 @@ background-image:
   will-change: transform;
 }
 
+/* Rank change identity shuffle animation: smoothly slides and reveals team name & score */
+@keyframes rank-identity-shuffle-up {
+  0% {
+    opacity: 0.2;
+    transform: translateY(18px) scale(0.96);
+  }
+  60% {
+    opacity: 0.95;
+    transform: translateY(-2px) scale(1.02);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes rank-identity-shuffle-down {
+  0% {
+    opacity: 0.2;
+    transform: translateY(-18px) scale(0.96);
+  }
+  60% {
+    opacity: 0.95;
+    transform: translateY(2px) scale(1.02);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.animate-shuffle-up {
+  animation: rank-identity-shuffle-up 0.75s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  will-change: transform, opacity;
+}
+
+.animate-shuffle-down {
+  animation: rank-identity-shuffle-down 0.75s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  will-change: transform, opacity;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .animate-float-1,
   .animate-float-2,
@@ -781,6 +822,8 @@ background-image:
   .animate-slot-spin-fast,
   .animate-champion-spotlight,
   .animate-card-flip,
+  .animate-shuffle-up,
+  .animate-shuffle-down,
   .animate-champion-banner,
   .animate-shimmer-sweep {
     animation: none !important;
