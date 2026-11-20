@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import React, { useEffect, useState, useRef } from "react";
 import { cn } from "cn";
 import { casinoSound } from "./casino-sound";
 
@@ -26,26 +26,29 @@ interface SingleDigitReelProps {
   onSettled?: () => void;
 }
 
-function SingleDigitReel({
+const SingleDigitReel = React.memo(function SingleDigitReel({
   targetDigit,
   isSpinning,
   settleDelayMs,
   variant,
   onSettled,
 }: SingleDigitReelProps) {
+  const [prevIsSpinning, setPrevIsSpinning] = useState(isSpinning);
   const [isSettling, setIsSettling] = useState(false);
   const [isSettled, setIsSettled] = useState(false);
-  const [prevSpinning, setPrevSpinning] = useState(isSpinning);
 
-  if (isSpinning !== prevSpinning) {
-    setPrevSpinning(isSpinning);
-    if (isSpinning) {
-      setIsSettling(false);
-      setIsSettled(false);
-    }
+  if (isSpinning !== prevIsSpinning) {
+    setPrevIsSpinning(isSpinning);
+    setIsSettling(false);
+    setIsSettled(false);
   }
 
   const settleDurationMs = 420;
+
+  const onSettledRef = useRef(onSettled);
+  useEffect(() => {
+    onSettledRef.current = onSettled;
+  }, [onSettled]);
 
   useEffect(() => {
     if (!isSpinning) {
@@ -60,7 +63,7 @@ function SingleDigitReel({
       lockTimer = setTimeout(() => {
         setIsSettled(true);
         casinoSound.playSlotReelLock();
-        onSettled?.();
+        onSettledRef.current?.();
       }, settleDurationMs);
     }, settleDelayMs);
 
@@ -68,7 +71,7 @@ function SingleDigitReel({
       clearTimeout(settleTimer);
       if (lockTimer) clearTimeout(lockTimer);
     };
-  }, [isSpinning, settleDelayMs, targetDigit, onSettled]);
+  }, [isSpinning, settleDelayMs, targetDigit]);
 
   const isLocked = !isSpinning || isSettling || isSettled;
   const isFastSpinning = isSpinning && !isSettling && !isSettled;
@@ -88,11 +91,34 @@ function SingleDigitReel({
     standard: "h-9 sm:h-10 lg:h-11",
   }[variant];
 
-  const fontSize = {
-    champion: "text-3xl sm:text-5xl lg:text-6xl font-black font-mono tabular-nums text-[#f7dc87] drop-shadow-[0_2px_14px_rgba(240,200,90,0.8)]",
-    silver: "text-2xl sm:text-4xl lg:text-5xl font-black font-mono tabular-nums text-[#f8f9fa] drop-shadow-[0_2px_12px_rgba(255,255,255,0.4)]",
-    bronze: "text-2xl sm:text-4xl lg:text-5xl font-black font-mono tabular-nums text-[#ffb399] drop-shadow-[0_2px_12px_rgba(192,57,43,0.5)]",
-    standard: "text-lg sm:text-xl lg:text-2xl font-black font-mono tabular-nums text-[#f7dc87] drop-shadow-[0_1px_8px_rgba(240,200,90,0.4)]",
+  const fontColor = {
+    champion: "text-[#f7dc87]",
+    silver: "text-[#f8f9fa]",
+    bronze: "text-[#ffb399]",
+    standard: "text-[#f7dc87]",
+  }[variant];
+
+  const fontSizes = {
+    champion: "text-3xl sm:text-5xl lg:text-6xl",
+    silver: "text-2xl sm:text-4xl lg:text-5xl",
+    bronze: "text-2xl sm:text-4xl lg:text-5xl",
+    standard: "text-lg sm:text-xl lg:text-2xl",
+  }[variant];
+
+  // Moving strip uses crisp GPU-compositing text drop shadow; locked settled digits display full metallic glow
+  const textGlow = {
+    champion: isLocked
+      ? "drop-shadow-[0_2px_12px_rgba(240,200,90,0.75)]"
+      : "drop-shadow-[0_1px_2px_rgba(0,0,0,0.95)]",
+    silver: isLocked
+      ? "drop-shadow-[0_2px_10px_rgba(255,255,255,0.4)]"
+      : "drop-shadow-[0_1px_2px_rgba(0,0,0,0.95)]",
+    bronze: isLocked
+      ? "drop-shadow-[0_2px_10px_rgba(192,57,43,0.5)]"
+      : "drop-shadow-[0_1px_2px_rgba(0,0,0,0.95)]",
+    standard: isLocked
+      ? "drop-shadow-[0_1px_6px_rgba(240,200,90,0.4)]"
+      : "drop-shadow-[0_1px_2px_rgba(0,0,0,0.95)]",
   }[variant];
 
   return (
@@ -106,15 +132,15 @@ function SingleDigitReel({
       {/* 3D Cylindrical Shadow Over Viewport Aperture */}
       <div className="absolute inset-0 pointer-events-none z-10 shadow-[inset_0_7px_8px_-2px_rgba(0,0,0,0.95),inset_0_-7px_8px_-2px_rgba(0,0,0,0.95)]" />
 
-      {/* Reel Digit Strip Track: Height is 100% of Viewport */}
+      {/* Reel Digit Strip Track: Height is 100% of Viewport, hardware composited */}
       <div
         className={cn(
-          "absolute inset-x-0 top-0 flex flex-col items-center",
+          "absolute inset-x-0 top-0 flex flex-col items-center will-change-transform",
           isFastSpinning && "animate-slot-spin-fast"
         )}
         style={{
           height: "100%", // Exactly 1 viewport height
-          transform: isLocked ? `translateY(-${targetDigit * 100}%)` : undefined,
+          transform: isLocked ? `translate3d(0, -${targetDigit * 100}%, 0)` : undefined,
           transition:
             isSettling && !isSettled
               ? `transform ${settleDurationMs}ms cubic-bezier(0.16, 1, 0.3, 1)`
@@ -125,8 +151,10 @@ function SingleDigitReel({
           <div
             key={d}
             className={cn(
-              "w-full h-full flex items-center justify-center shrink-0 leading-none select-none",
-              fontSize
+              "w-full h-full flex items-center justify-center shrink-0 leading-none select-none font-black font-mono tabular-nums",
+              fontSizes,
+              fontColor,
+              textGlow
             )}
             style={{ height: "100%" }}
           >
@@ -136,9 +164,9 @@ function SingleDigitReel({
       </div>
     </div>
   );
-}
+});
 
-export function SlotScoreReel({
+export const SlotScoreReel = React.memo(function SlotScoreReel({
   value,
   delta = null,
   isSpinning = false,
@@ -304,4 +332,4 @@ export function SlotScoreReel({
       )}
     </div>
   );
-}
+});

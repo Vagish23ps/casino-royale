@@ -1,5 +1,6 @@
 "use client";
 
+import { useState } from "react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { cn } from "cn";
@@ -60,8 +61,16 @@ export function AdminHeader({
   const pathname = usePathname();
   const router = useRouter();
   const pageTitle = getPageTitle(pathname);
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const [prevPathname, setPrevPathname] = useState(pathname);
+
+  if (pathname !== prevPathname) {
+    setPrevPathname(pathname);
+    setMobileMenuOpen(false);
+  }
 
   const handleSignOut = async () => {
+    setMobileMenuOpen(false);
     const supabase = createClient();
     await supabase.auth.signOut();
     router.push("/login");
@@ -77,7 +86,7 @@ export function AdminHeader({
       {/* Left: Mobile menu + Page title */}
       <div className="flex items-center gap-3">
         {/* Mobile nav trigger */}
-        <Sheet>
+        <Sheet open={mobileMenuOpen} onOpenChange={setMobileMenuOpen}>
           <SheetTrigger
             className={cn(
               buttonVariants({ variant: "ghost", size: "icon" }),
@@ -119,26 +128,23 @@ export function AdminHeader({
                     pathname?.startsWith(item.href));
                 const Icon = item.icon;
                 return (
-                  <SheetClose
+                  <Link
                     key={item.href}
-                    render={
-                      <Link
-                        href={item.href}
-                        className={cn(
-                          "flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors relative",
-                          isActive
-                            ? "bg-gold/10 text-gold"
-                            : "text-muted-foreground hover:text-foreground hover:bg-muted"
-                        )}
-                      >
-                        {isActive && (
-                          <div className="absolute left-0 top-1/2 -translate-y-1/2 w-[3px] h-5 rounded-r-full bg-gold" />
-                        )}
-                        <Icon className={cn("w-4 h-4 shrink-0", isActive ? "text-gold" : "")} />
-                        <span>{item.label}</span>
-                      </Link>
-                    }
-                  />
+                    href={item.href}
+                    onClick={() => setMobileMenuOpen(false)}
+                    className={cn(
+                      "flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors relative",
+                      isActive
+                        ? "bg-gold/10 text-gold"
+                        : "text-muted-foreground hover:text-foreground hover:bg-muted"
+                    )}
+                  >
+                    {isActive && (
+                      <div className="absolute left-0 top-1/2 -translate-y-1/2 w-[3px] h-5 rounded-r-full bg-gold" />
+                    )}
+                    <Icon className={cn("w-4 h-4 shrink-0", isActive ? "text-gold" : "")} />
+                    <span>{item.label}</span>
+                  </Link>
                 );
               })}
 

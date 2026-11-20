@@ -608,67 +608,79 @@ export async function getPublicScoreboardData() {
     if (ev) event = ev as Event;
 
     if (event?.id) {
-      const { data: st } = await supabase
-        .from("event_settings")
-        .select("*")
-        .eq("event_id", event.id)
-        .maybeSingle();
+      const eventId = event.id;
 
-      if (st) settings = st as EventSettings;
+      // Parallelize independent queries for settings, active round, and leaderboard view
+      const [stResult, rndResult, viewResult] = await Promise.all([
+        supabase
+          .from("event_settings")
+          .select("*")
+          .eq("event_id", eventId)
+          .maybeSingle(),
+        supabase
+          .from("rounds")
+          .select("*")
+          .eq("event_id", eventId)
+          .eq("status", "active")
+          .is("deleted_at", null)
+          .maybeSingle(),
+        supabase
+          .from("v_public_overall_leaderboard")
+          .select("*")
+          .eq("event_id", eventId)
+          .order("rank", { ascending: true }),
+      ]);
 
-      const { data: rnd } = await supabase
-        .from("rounds")
-        .select("*")
-        .eq("event_id", event.id)
-        .eq("status", "active")
-        .is("deleted_at", null)
-        .maybeSingle();
+      if (stResult.data) settings = stResult.data as EventSettings;
+      if (rndResult.data) activeRound = rndResult.data as Round;
 
-      if (rnd) activeRound = rnd as Round;
-    }
+      const viewData = viewResult.data;
+      const viewErr = viewResult.error;
 
-    // Try view (scoped to active event to prevent cross-event score drift)
-    let viewQuery = supabase
-      .from("v_public_overall_leaderboard")
-      .select("*");
+      if (!viewErr && viewData && viewData.length > 0) {
+        leaderboard = (viewData as Record<string, unknown>[]).map((d) => ({
+          team_id: String(d.team_id || ""),
+          team_name: String(d.team_name || ""),
+          team_color: typeof d.team_color === "string" ? d.team_color : null,
+          avatar_url: typeof d.avatar_url === "string" ? d.avatar_url : null,
+          total_score: Number(d.total_score || 0),
+          rank: Number(d.rank || 1),
+        }));
+      } else {
+        // Fallback: load active teams and starting scores without accessing restricted transaction ledger
+        const { data: tData } = await supabase
+          .from("teams")
+          .select("*")
+          .eq("event_id", eventId)
+          .is("deleted_at", null);
 
-    if (event?.id) {
-      viewQuery = viewQuery.eq("event_id", event.id);
-    }
-
-    const { data: viewData, error: viewErr } = await viewQuery.order("rank", { ascending: true });
-
-    if (!viewErr && viewData && viewData.length > 0) {
-      leaderboard = (viewData as Record<string, unknown>[]).map((d) => ({
-        team_id: String(d.team_id || ""),
-        team_name: String(d.team_name || ""),
-        team_color: typeof d.team_color === "string" ? d.team_color : null,
-        avatar_url: typeof d.avatar_url === "string" ? d.avatar_url : null,
-        total_score: Number(d.total_score || 0),
-        rank: Number(d.rank || 1),
-      }));
-    } else {
-      // Fallback: load active teams and starting scores without accessing restricted transaction ledger
-      let tQuery = supabase
-        .from("teams")
-        .select("*")
-        .is("deleted_at", null);
-
-      if (event?.id) {
-        tQuery = tQuery.eq("event_id", event.id);
+        if (tData && tData.length > 0) {
+          const startingScore = Number(settings?.starting_score || 0.0);
+          leaderboard = (tData as Team[]).map((team, idx) => ({
+            team_id: team.id,
+            team_name: team.name,
+            team_color: team.color,
+            avatar_url: team.avatar_url,
+            total_score: startingScore,
+            rank: idx + 1,
+          }));
+        }
       }
+    } else {
+      // If no event found, attempt unscoped leaderboard query as fallback
+      const { data: viewData, error: viewErr } = await supabase
+        .from("v_public_overall_leaderboard")
+        .select("*")
+        .order("rank", { ascending: true });
 
-      const { data: tData } = await tQuery;
-
-      if (tData && tData.length > 0) {
-        const startingScore = Number(settings?.starting_score || 0.0);
-        leaderboard = (tData as Team[]).map((team, idx) => ({
-          team_id: team.id,
-          team_name: team.name,
-          team_color: team.color,
-          avatar_url: team.avatar_url,
-          total_score: startingScore,
-          rank: idx + 1,
+      if (!viewErr && viewData && viewData.length > 0) {
+        leaderboard = (viewData as Record<string, unknown>[]).map((d) => ({
+          team_id: String(d.team_id || ""),
+          team_name: String(d.team_name || ""),
+          team_color: typeof d.team_color === "string" ? d.team_color : null,
+          avatar_url: typeof d.avatar_url === "string" ? d.avatar_url : null,
+          total_score: Number(d.total_score || 0),
+          rank: Number(d.rank || 1),
         }));
       }
     }

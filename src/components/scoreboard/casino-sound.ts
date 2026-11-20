@@ -243,7 +243,7 @@ class CasinoSoundController {
 
   // Mechanical slot reel digit stop & lock snap
   public playSlotReelLock() {
-    if (this.isMuted || !this.ctx) return;
+    if (this.isMuted || !this.ctx || this.shouldThrottle("slot_reel_lock", 35)) return;
     try {
       const osc = this.ctx.createOscillator();
       const gain = this.ctx.createGain();

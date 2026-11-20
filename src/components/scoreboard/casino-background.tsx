@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef } from "react";
+import React, { useEffect, useRef } from "react";
 
 interface CasinoBackgroundProps {
   isCelebration?: boolean;
@@ -20,12 +20,14 @@ interface Particle {
   isChip?: boolean;
 }
 
-export function CasinoBackground({ isCelebration = false }: CasinoBackgroundProps) {
+export const CasinoBackground = React.memo(function CasinoBackground({
+  isCelebration = false,
+}: CasinoBackgroundProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const parallaxLayer1Ref = useRef<HTMLDivElement | null>(null);
   const parallaxLayer2Ref = useRef<HTMLDivElement | null>(null);
 
-  // Parallax subtle depth effect on mousemove
+  // Parallax subtle depth effect on mousemove with idle convergence stop
   useEffect(() => {
     const prefersReduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     if (prefersReduced) return;
@@ -34,39 +36,89 @@ export function CasinoBackground({ isCelebration = false }: CasinoBackgroundProp
     let targetY = 0;
     let currentX = 0;
     let currentY = 0;
-    let animId: number;
+    let animId: number | null = null;
+    let isRunning = false;
 
-    const handleMouseMove = (e: MouseEvent) => {
-      const halfW = window.innerWidth / 2;
-      const halfH = window.innerHeight / 2;
-      targetX = (e.clientX - halfW) / halfW; // -1 to 1
-      targetY = (e.clientY - halfH) / halfH; // -1 to 1
+    const applyTransform = (x: number, y: number) => {
+      if (parallaxLayer1Ref.current) {
+        parallaxLayer1Ref.current.style.transform = `translate3d(${x * 6}px, ${y * 6}px, 0)`;
+      }
+      if (parallaxLayer2Ref.current) {
+        parallaxLayer2Ref.current.style.transform = `translate3d(${x * 14}px, ${y * 14}px, 0)`;
+      }
     };
 
     const updateParallax = () => {
-      currentX += (targetX - currentX) * 0.05;
-      currentY += (targetY - currentY) * 0.05;
+      if (document.visibilityState === "hidden") {
+        isRunning = false;
+        animId = null;
+        return;
+      }
 
-      if (parallaxLayer1Ref.current) {
-        parallaxLayer1Ref.current.style.transform = `translate3d(${currentX * 6}px, ${currentY * 6}px, 0)`;
+      const dx = targetX - currentX;
+      const dy = targetY - currentY;
+
+      // When difference is subpixel-negligible, snap to target and STOP the rAF loop
+      if (Math.abs(dx) < 0.0005 && Math.abs(dy) < 0.0005) {
+        currentX = targetX;
+        currentY = targetY;
+        applyTransform(currentX, currentY);
+        isRunning = false;
+        animId = null;
+        return;
       }
-      if (parallaxLayer2Ref.current) {
-        parallaxLayer2Ref.current.style.transform = `translate3d(${currentX * 14}px, ${currentY * 14}px, 0)`;
-      }
+
+      currentX += dx * 0.05;
+      currentY += dy * 0.05;
+      applyTransform(currentX, currentY);
 
       animId = requestAnimationFrame(updateParallax);
     };
 
+    const handleMouseMove = (e: MouseEvent) => {
+      const halfW = window.innerWidth / 2;
+      const halfH = window.innerHeight / 2;
+      targetX = (e.clientX - halfW) / halfW;
+      targetY = (e.clientY - halfH) / halfH;
+
+      if (!isRunning && document.visibilityState !== "hidden") {
+        isRunning = true;
+        animId = requestAnimationFrame(updateParallax);
+      }
+    };
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "hidden") {
+        if (animId !== null) {
+          cancelAnimationFrame(animId);
+          animId = null;
+        }
+        isRunning = false;
+      } else {
+        if (Math.abs(targetX - currentX) > 0.001 || Math.abs(targetY - currentY) > 0.001) {
+          isRunning = true;
+          animId = requestAnimationFrame(updateParallax);
+        }
+      }
+    };
+
     window.addEventListener("mousemove", handleMouseMove, { passive: true });
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+
+    // Initial settle
+    isRunning = true;
     animId = requestAnimationFrame(updateParallax);
 
     return () => {
       window.removeEventListener("mousemove", handleMouseMove);
-      cancelAnimationFrame(animId);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+      if (animId !== null) {
+        cancelAnimationFrame(animId);
+      }
     };
   }, []);
 
-  // Canvas particle effervescence & celebration confetti
+  // Canvas particle effervescence & celebration confetti with lifecycle pausing
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -74,7 +126,14 @@ export function CasinoBackground({ isCelebration = false }: CasinoBackgroundProp
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
-    let animId: number;
+    const prefersReduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    if (prefersReduced) {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      return;
+    }
+
+    let animId: number | null = null;
+    let isRunning = true;
     let width = (canvas.width = window.innerWidth);
     let height = (canvas.height = window.innerHeight);
 
@@ -135,15 +194,13 @@ export function CasinoBackground({ isCelebration = false }: CasinoBackgroundProp
       }
     }
 
-    let isRunning = true;
     const render = () => {
-      if (!isRunning) return;
-      ctx.clearRect(0, 0, width, height);
-
-      const prefersReduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-      if (prefersReduced) {
+      if (!isRunning || document.visibilityState === "hidden") {
+        animId = null;
         return;
       }
+
+      ctx.clearRect(0, 0, width, height);
 
       for (let i = particles.length - 1; i >= 0; i--) {
         const p = particles[i];
@@ -168,14 +225,12 @@ export function CasinoBackground({ isCelebration = false }: CasinoBackgroundProp
           }
         }
 
-        ctx.save();
+        // Direct, high-performance canvas 2D draw calls without expensive ctx.save()/ctx.restore() thrashing
         ctx.globalAlpha = Math.max(0, p.alpha);
-        ctx.translate(p.x, p.y);
-        ctx.rotate(p.rotation);
 
         if (p.isChip) {
           ctx.beginPath();
-          ctx.arc(0, 0, p.size, 0, Math.PI * 2);
+          ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
           ctx.fillStyle = p.color;
           ctx.fill();
           ctx.lineWidth = 1.2;
@@ -184,21 +239,37 @@ export function CasinoBackground({ isCelebration = false }: CasinoBackgroundProp
         } else {
           ctx.fillStyle = p.color;
           ctx.beginPath();
-          ctx.arc(0, 0, p.size, 0, Math.PI * 2);
+          ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
           ctx.fill();
         }
-        ctx.restore();
       }
 
       animId = requestAnimationFrame(render);
     };
 
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "hidden") {
+        if (animId !== null) {
+          cancelAnimationFrame(animId);
+          animId = null;
+        }
+      } else {
+        if (animId === null && isRunning) {
+          animId = requestAnimationFrame(render);
+        }
+      }
+    };
+
+    document.addEventListener("visibilitychange", handleVisibilityChange);
     animId = requestAnimationFrame(render);
 
     return () => {
       isRunning = false;
-      cancelAnimationFrame(animId);
+      if (animId !== null) {
+        cancelAnimationFrame(animId);
+      }
       window.removeEventListener("resize", handleResize);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
     };
   }, [isCelebration]);
 
@@ -358,4 +429,4 @@ export function CasinoBackground({ isCelebration = false }: CasinoBackgroundProp
       <canvas ref={canvasRef} className="absolute inset-0 pointer-events-none w-full h-full z-10" />
     </div>
   );
-}
+});

@@ -1,15 +1,11 @@
 "use client";
 
-import { useEffect, useState, useCallback, useRef, useLayoutEffect } from "react";
+import { useEffect, useState, useCallback, useRef, useLayoutEffect, useSyncExternalStore } from "react";
 import Image from "next/image";
 import {
   Crown,
-  Trophy,
-  Medal,
   Maximize,
   Minimize,
-  TrendingUp,
-  TrendingDown,
   Volume2,
   VolumeX,
   FastForward,
@@ -19,10 +15,19 @@ import { cn } from "cn";
 import { createClient } from "@/lib/supabase/client";
 import type { Event, EventSettings, Round, LeaderboardEntry, Team } from "@/lib/types";
 import { CasinoBackground } from "./casino-background";
-import { SlotScoreReel } from "./slot-score-reel";
-import { TeamNameplate } from "./team-nameplate";
+import { PodiumCard } from "./podium-card";
+import { LeaderboardRow } from "./leaderboard-row";
 import { BrandReveal } from "./brand-reveal";
 import { casinoSound } from "./casino-sound";
+import {
+  saveScoreboardSnapshot,
+  loadScoreboardSnapshot,
+  updateLeaderboardCacheScores,
+} from "@/lib/scoreboard-cache";
+import {
+  SCOREBOARD_POLLING_CONFIG,
+  type RealtimeConnectionStatus,
+} from "@/lib/scoreboard-config";
 
 type LiveScoreboardProps = {
   initialEvent: Event | null;
@@ -40,11 +45,11 @@ type RankShiftInfo = {
 };
 
 // 5-State Sequential Scoreboard Animation Machine:
-// STATE 1: SCORE_ROLLING       - Scores spin in-place; leaderboard visual ordering frozen
-// STATE 2: DIGITS_SETTLING     - Waiting for every affected reel to lock completely
-// STATE 3: DIGITS_SETTLED      - All digits settled; check if ranking changed
-// STATE 4: NAMEPLATE_SHUFFLING - Physical rectangular nameplates & scores slide between rank slots
-// STATE 5: SETTLED             - Slide finished; rank badges revealed; celebration if leader changed
+// STATE 1: SCORE_ROLLING       - Scores spin in-place; visual visualOrder frozen
+// STATE 2: DIGITS_SETTLING     - Waiting for all affected reels to visually lock
+// STATE 3: DIGITS_SETTLED      - All digits settled at latest scores; pause & determine rank change
+// STATE 4: NAMEPLATE_SHUFFLING - Single shared identity wrapper slides between rank positions (FLIP)
+// STATE 5: SETTLED             - Movement complete; reveal rank shift badges & celebrations
 type ScoreboardAnimState =
   | "IDLE"
   | "SCORE_ROLLING"
@@ -56,17 +61,11 @@ type ScoreboardAnimState =
 // Layout helpers for dynamic alignment of teams ranked 4th and below
 function getRestContainerClass(count: number): string {
   if (count === 1) {
-    // 4 total teams: One lower-ranked team, centred horizontally
     return "flex justify-center w-full";
   }
   if (count >= 2 && count <= 5) {
-    // 5 total teams (count 2): one left, one right
-    // 6 total teams (count 3): two on first row, third centred on second row
-    // 7 total teams (count 4): 2 rows of 2
-    // 8 total teams (count 5): 2 rows of 2 + 1 centred on third row
     return "grid grid-cols-1 sm:grid-cols-2 gap-2.5 sm:gap-3.5 max-w-4xl mx-auto w-full";
   }
-  // Larger numbers: balanced 3-column responsive grid with scrollbar
   return "grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2 sm:gap-2.5 max-h-48 sm:max-h-60 lg:max-h-68 overflow-y-auto admin-scroll pr-1.5 w-full";
 }
 
@@ -75,18 +74,37 @@ function getRestItemClass(index: number, count: number): string {
     return "w-full max-w-md sm:max-w-lg";
   }
   if (count === 3 && index === 2) {
-    // 6 total teams: third team centred on second row
     return "sm:col-span-2 sm:max-w-md sm:mx-auto w-full";
   }
   if (count === 5 && index === 4) {
-    // 8 total teams: 5th team centred on third row
     return "sm:col-span-2 sm:max-w-md sm:mx-auto w-full";
   }
   if (count > 5 && count % 3 === 1 && index === count - 1) {
-    // Trailing item in 3-column layout centred across columns
     return "lg:col-span-3 lg:max-w-md lg:mx-auto w-full";
   }
   return "w-full";
+}
+
+// React 19 Deterministic Hydration & Network Observers (useSyncExternalStore)
+const emptySubscribe = () => () => {};
+
+function subscribeOnline(callback: () => void) {
+  window.addEventListener("online", callback);
+  window.addEventListener("offline", callback);
+  return () => {
+    window.removeEventListener("online", callback);
+    window.removeEventListener("offline", callback);
+  };
+}
+
+function getOnlineSnapshot(): boolean {
+  return typeof navigator !== "undefined" && typeof navigator.onLine === "boolean"
+    ? navigator.onLine
+    : true;
+}
+
+function getServerOnlineSnapshot(): boolean {
+  return true;
 }
 
 export function LiveScoreboard({
@@ -97,66 +115,217 @@ export function LiveScoreboard({
   isPublicView = false,
   headingFontClassName,
 }: LiveScoreboardProps) {
-  const [event] = useState<Event | null>(initialEvent);
+  const [event, setEvent] = useState<Event | null>(initialEvent);
   const eventId = event?.id || initialEvent?.id || null;
-  const [leaderboard, setLeaderboard] = useState<LeaderboardEntry[]>(initialLeaderboard);
-  const [settings] = useState<EventSettings | null>(initialSettings);
+  const eventRef = useRef<Event | null>(initialEvent);
+  useEffect(() => {
+    eventRef.current = event;
+  }, [event]);
+
+  const [settings, setSettings] = useState<EventSettings | null>(initialSettings);
+  const settingsRef = useRef<EventSettings | null>(initialSettings);
+  useEffect(() => {
+    settingsRef.current = settings;
+  }, [settings]);
+
   const [activeRound, setActiveRound] = useState<Round | null>(initialRound);
+  const activeRoundRef = useRef<Round | null>(initialRound);
+  useEffect(() => {
+    activeRoundRef.current = activeRound;
+  }, [activeRound]);
+
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [crownCelebration, setCrownCelebration] = useState(false);
   const [rankShifts, setRankShifts] = useState<Record<string, RankShiftInfo>>({});
   const [isAudioMuted, setIsAudioMuted] = useState(true);
 
+  // Connection & Adaptive Polling State (Deterministic Initial Hydration via useSyncExternalStore)
+  const isMounted = useSyncExternalStore(
+    emptySubscribe,
+    () => true,
+    () => false
+  );
+  const isOnline = useSyncExternalStore(
+    subscribeOnline,
+    getOnlineSnapshot,
+    getServerOnlineSnapshot
+  );
+  const isOnlineRef = useRef<boolean>(true);
+  useEffect(() => {
+    isOnlineRef.current = isOnline;
+  }, [isOnline]);
+
+  const [channelStatus, setChannelStatus] = useState<RealtimeConnectionStatus>("CONNECTING");
+  const channelStatusRef = useRef<RealtimeConnectionStatus>("CONNECTING");
+  useEffect(() => {
+    channelStatusRef.current = channelStatus;
+  }, [channelStatus]);
+
+  const [hasReconciled, setHasReconciled] = useState<boolean>(false);
+  const [isServingCache, setIsServingCache] = useState<boolean>(false);
+
+  // Polling, Backoff, and Channel References
+  const fallbackIntervalRef = useRef<number>(SCOREBOARD_POLLING_CONFIG.FALLBACK_INITIAL_INTERVAL_MS);
+  const pollingTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const reconnectTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const channelRef = useRef<ReturnType<ReturnType<typeof createClient>["channel"]> | null>(null);
+
   // Brand Reveal Intro State
   const [showBrandIntro, setShowBrandIntro] = useState<boolean>(isPublicView);
 
-  // 5-State Sequential Animation Machine
+  // 1. TEAMS CATALOG (Stable metadata keyed by team_id)
+  const [teamsCatalog, setTeamsCatalog] = useState<Record<string, LeaderboardEntry>>(() => {
+    const map: Record<string, LeaderboardEntry> = {};
+    initialLeaderboard.forEach((t) => {
+      map[t.team_id] = t;
+    });
+    return map;
+  });
+
+  // 2. AUTHORITATIVE SCORES (Direct store of latest score per team ID)
+  const [teamScores, setTeamScores] = useState<Record<string, number>>(() => {
+    const map: Record<string, number> = {};
+    initialLeaderboard.forEach((t) => {
+      map[t.team_id] = t.total_score;
+    });
+    return map;
+  });
+  const teamScoresRef = useRef<Record<string, number>>({});
+
+  // 3. VISUAL SLOT ORDER (Frozen during score roll, reordered strictly during shuffle)
+  const [visualOrder, setVisualOrder] = useState<string[]>(() =>
+    initialLeaderboard.map((t) => t.team_id)
+  );
+  const visualOrderRef = useRef<string[]>([]);
+
+  // 4. ANIMATION STATE MACHINE
   const [animState, setAnimState] = useState<ScoreboardAnimState>("IDLE");
   const animStateRef = useRef<ScoreboardAnimState>("IDLE");
 
   const [isSlotSpinning, setIsSlotSpinning] = useState(false);
   const [isNameplateShuffling, setIsNameplateShuffling] = useState(false);
+  const [shufflingTeamIds, setShufflingTeamIds] = useState<string[]>([]);
   const [affectedTeamIds, setAffectedTeamIds] = useState<string[]>([]);
+  const affectedTeamIdsRef = useRef<string[]>([]);
   const [scoreDeltas, setScoreDeltas] = useState<Record<string, number>>({});
+  const teamsCatalogRef = useRef<Record<string, LeaderboardEntry>>({});
 
   const spinTimerRef = useRef<NodeJS.Timeout | null>(null);
   const pauseTimerRef = useRef<NodeJS.Timeout | null>(null);
   const rankResetTimerRef = useRef<NodeJS.Timeout | null>(null);
 
-  // Sequential animation tracking refs
-  const pendingRankedRef = useRef<LeaderboardEntry[] | null>(null);
-  const settledTeamsRef = useRef<Set<string>>(new Set());
-  const firstNameplateRectsRef = useRef<Record<string, DOMRect> | null>(null);
-  const firstScoreRectsRef = useRef<Record<string, DOMRect> | null>(null);
+  // FLIP and sequencing refs
+  const firstRectsRef = useRef<Record<string, DOMRect> | null>(null);
   const pendingShiftsRef = useRef<Record<string, RankShiftInfo> | null>(null);
+  const settledTeamsRef = useRef<Set<string>>(new Set());
 
-  // Score and Rank tracking refs (Authoritative baseline)
+  // Historical reference tracking
   const prevLeaderId = useRef<string | null>(initialLeaderboard[0]?.team_id || null);
-  const prevRanksRef = useRef<Record<string, number>>({});
   const prevScoresRef = useRef<Record<string, number>>({});
   const isInitialMountRef = useRef<boolean>(true);
-
-  // Request sequencing and deduplication refs to prevent stale/out-of-order overwrite
   const latestRequestIdRef = useRef<number>(0);
   const latestProcessedTimestampRef = useRef<number>(0);
 
-  // Synchronize state ref helper
+  // Synchronize refs in effects to satisfy react-hooks/refs
+  useEffect(() => {
+    visualOrderRef.current = visualOrder;
+  }, [visualOrder]);
+
+  useEffect(() => {
+    teamScoresRef.current = teamScores;
+  }, [teamScores]);
+
+  useEffect(() => {
+    affectedTeamIdsRef.current = affectedTeamIds;
+  }, [affectedTeamIds]);
+
+  useEffect(() => {
+    teamsCatalogRef.current = teamsCatalog;
+  }, [teamsCatalog]);
+
   const updateAnimState = useCallback((state: ScoreboardAnimState) => {
     animStateRef.current = state;
     setAnimState(state);
   }, []);
 
-  // Initialize previous scores & ranks on initial mount
+  // Initialize catalogs on mount or initialLeaderboard change, with localStorage snapshot persistence/hydration
   useEffect(() => {
-    const scoreMap: Record<string, number> = {};
-    const rankMap: Record<string, number> = {};
-    initialLeaderboard.forEach((t) => {
-      scoreMap[t.team_id] = t.total_score;
-      rankMap[t.team_id] = t.rank;
-    });
-    prevScoresRef.current = scoreMap;
-    prevRanksRef.current = rankMap;
-  }, [initialLeaderboard]);
+    const cached = loadScoreboardSnapshot(eventId);
+
+    if (eventId && initialLeaderboard.length > 0) {
+      // If we have a cached snapshot with newer authoritative timestamp than SSR initialLeaderboard,
+      // preserve the newer cached state instead of regressing to stale SSR data
+      if (cached && cached.cachedAt > latestProcessedTimestampRef.current && cached.leaderboard.length > 0) {
+        setIsServingCache(false);
+        latestProcessedTimestampRef.current = cached.cachedAt;
+        const map: Record<string, LeaderboardEntry> = {};
+        const scores: Record<string, number> = {};
+        cached.leaderboard.forEach((t) => {
+          map[t.team_id] = t;
+          scores[t.team_id] = t.total_score;
+          prevScoresRef.current[t.team_id] = t.total_score;
+        });
+        prevLeaderId.current = cached.leaderboard[0]?.team_id || null;
+        teamScoresRef.current = scores;
+        setTeamsCatalog((prev) => ({ ...prev, ...map }));
+        setTeamScores(scores);
+        const order = cached.leaderboard.map((t) => t.team_id);
+        visualOrderRef.current = order;
+        setVisualOrder(order);
+        if (cached.activeRound) setActiveRound(cached.activeRound);
+        return;
+      }
+
+      const catalogUpdates: Record<string, LeaderboardEntry> = {};
+      initialLeaderboard.forEach((t) => {
+        catalogUpdates[t.team_id] = t;
+        prevScoresRef.current[t.team_id] = t.total_score;
+      });
+      setTeamsCatalog((prev) => ({ ...prev, ...catalogUpdates }));
+      const now = Date.now();
+      if (now > latestProcessedTimestampRef.current) {
+        latestProcessedTimestampRef.current = now;
+      }
+      saveScoreboardSnapshot({
+        eventId,
+        event,
+        settings,
+        activeRound,
+        leaderboard: initialLeaderboard,
+        cachedAt: now,
+      });
+      setIsServingCache(false);
+    } else {
+      // If initial server data is empty (e.g. offline or failed initial load), check cache
+      if (cached && cached.leaderboard.length > 0) {
+        setIsServingCache(true);
+        latestProcessedTimestampRef.current = cached.cachedAt;
+        const map: Record<string, LeaderboardEntry> = {};
+        const scores: Record<string, number> = {};
+        cached.leaderboard.forEach((t) => {
+          map[t.team_id] = t;
+          scores[t.team_id] = t.total_score;
+          prevScoresRef.current[t.team_id] = t.total_score;
+        });
+        prevLeaderId.current = cached.leaderboard[0]?.team_id || null;
+        teamScoresRef.current = scores;
+        setTeamsCatalog(map);
+        setTeamScores(scores);
+        const order = cached.leaderboard.map((t) => t.team_id);
+        visualOrderRef.current = order;
+        setVisualOrder(order);
+        if (cached.activeRound) {
+          setActiveRound(cached.activeRound);
+        }
+        if (cached.event && !event) {
+          setEvent(cached.event);
+        }
+        if (cached.settings && !settings) {
+          setSettings(cached.settings);
+        }
+      }
+    }
+  }, [eventId, event, settings, activeRound, initialLeaderboard]);
 
   // Handle immediate skip of the reveal sequence
   const handleSkipReveal = useCallback(() => {
@@ -165,86 +334,86 @@ export function LiveScoreboard({
     if (rankResetTimerRef.current) clearTimeout(rankResetTimerRef.current);
     casinoSound.stopSlotRoll();
 
-    // Reset any in-flight nameplate & score transforms
-    const movingEls = document.querySelectorAll<HTMLElement>(
-      "[data-team-nameplate], [data-team-score]"
-    );
-    movingEls.forEach((el) => {
+    // Reset any in-flight transforms on identity wrappers
+    document.querySelectorAll<HTMLElement>("[data-team-identity]").forEach((el) => {
       el.style.transform = "";
       el.style.transition = "";
       el.style.zIndex = "";
     });
 
-    if (pendingRankedRef.current) {
-      setLeaderboard(pendingRankedRef.current);
-    }
+    // Immediately snap visual order to authoritative score ranking
+    const allIds = Object.keys(teamsCatalogRef.current);
+    const sorted = [...allIds].sort((a, b) => {
+      const sa = teamScoresRef.current[a] ?? 0;
+      const sb = teamScoresRef.current[b] ?? 0;
+      return sb - sa;
+    });
 
+    visualOrderRef.current = sorted;
+    setVisualOrder(sorted);
     setShowBrandIntro(false);
     setIsSlotSpinning(false);
     setIsNameplateShuffling(false);
+    setShufflingTeamIds([]);
     updateAnimState("IDLE");
     setAffectedTeamIds([]);
     setScoreDeltas({});
   }, [updateAnimState]);
 
-  // Brand reveal completion handler
   const handleBrandRevealComplete = useCallback(() => {
     setShowBrandIntro(false);
   }, []);
 
-  // STATE 4: Launch physical rectangular nameplate and score shuffle
-  const startNameplateShuffle = useCallback(
-    (targetLeaderboard: LeaderboardEntry[], newShifts: Record<string, RankShiftInfo>) => {
-      // 1. FIRST: Measure bounding rects of nameplates and scores before DOM reorder
-      const nameplateRects: Record<string, DOMRect> = {};
-      const scoreRects: Record<string, DOMRect> = {};
-
-      document.querySelectorAll<HTMLElement>("[data-team-nameplate]").forEach((el) => {
-        const id = el.getAttribute("data-team-nameplate");
-        if (id) nameplateRects[id] = el.getBoundingClientRect();
+  // STATE 4: Launch physical shuffle of the single identity wrapper (FLIP)
+  const startIdentityShuffle = useCallback(
+    (targetOrder: string[], newShifts: Record<string, RankShiftInfo>) => {
+      // 1. FIRST: Measure bounding rects of the single identity wrapper per team
+      const rects: Record<string, DOMRect> = {};
+      document.querySelectorAll<HTMLElement>("[data-team-identity]").forEach((el) => {
+        const id = el.getAttribute("data-team-identity");
+        if (id) rects[id] = el.getBoundingClientRect();
       });
 
-      document.querySelectorAll<HTMLElement>("[data-team-score]").forEach((el) => {
-        const id = el.getAttribute("data-team-score");
-        if (id) scoreRects[id] = el.getBoundingClientRect();
-      });
-
-      firstNameplateRectsRef.current = nameplateRects;
-      firstScoreRectsRef.current = scoreRects;
+      firstRectsRef.current = rects;
       pendingShiftsRef.current = newShifts;
 
+      setShufflingTeamIds(Object.keys(newShifts));
       setIsNameplateShuffling(true);
       updateAnimState("NAMEPLATE_SHUFFLING");
 
-      // 2. LAST: Apply target ranking to React state (DOM will reorder into new slots)
-      setLeaderboard(targetLeaderboard);
+      // 2. LAST: Apply target visual order to React state (DOM will place elements into new slots)
+      visualOrderRef.current = targetOrder;
+      setVisualOrder(targetOrder);
     },
     [updateAnimState]
   );
 
   // STATE 3: Invoked when ALL affected slot score reels have settled completely
   const handleAllReelsSettled = useCallback(() => {
+    if (animStateRef.current !== "SCORE_ROLLING") return;
     setIsSlotSpinning(false);
     casinoSound.stopSlotRoll();
     updateAnimState("DIGITS_SETTLED");
 
-    const nextRanked = pendingRankedRef.current;
-    if (!nextRanked) {
-      updateAnimState("IDLE");
-      return;
-    }
+    // Compute target ranking order based on current authoritative scores
+    const currentOrder = visualOrderRef.current;
+    const sorted = [...currentOrder].sort((a, b) => {
+      const sa = teamScoresRef.current[a] ?? 0;
+      const sb = teamScoresRef.current[b] ?? 0;
+      return sb - sa;
+    });
 
-    // Compare current displayed visual order vs target ranked order
-    let rankOrderChanged = false;
+    // Check if visual ordering changed
+    let orderChanged = false;
     const newShifts: Record<string, RankShiftInfo> = {};
 
-    leaderboard.forEach((team, oldIdx) => {
-      const newIdx = nextRanked.findIndex((t) => t.team_id === team.team_id);
+    currentOrder.forEach((teamId, oldIdx) => {
+      const newIdx = sorted.indexOf(teamId);
       const oldRank = oldIdx + 1;
       const newRank = newIdx >= 0 ? newIdx + 1 : oldRank;
       if (oldRank !== newRank) {
-        rankOrderChanged = true;
-        newShifts[team.team_id] = {
+        orderChanged = true;
+        newShifts[teamId] = {
           from: oldRank,
           to: newRank,
           direction: newRank < oldRank ? "up" : "down",
@@ -252,9 +421,8 @@ export function LiveScoreboard({
       }
     });
 
-    if (!rankOrderChanged) {
+    if (!orderChanged) {
       // Score updated, but ranking order unchanged: keep teams in place without shuffle!
-      setLeaderboard(nextRanked);
       updateAnimState("SETTLED");
       if (rankResetTimerRef.current) clearTimeout(rankResetTimerRef.current);
       rankResetTimerRef.current = setTimeout(() => {
@@ -265,46 +433,43 @@ export function LiveScoreboard({
       return;
     }
 
-    // Rank order CHANGED! Give 250ms satisfying pause with locked scores before shuffle starts
+    // Rank order CHANGED! Give 350ms satisfying pause with settled score numbers before shuffle starts
     if (pauseTimerRef.current) clearTimeout(pauseTimerRef.current);
     pauseTimerRef.current = setTimeout(() => {
-      startNameplateShuffle(nextRanked, newShifts);
-    }, 250);
-  }, [leaderboard, updateAnimState, startNameplateShuffle]);
+      startIdentityShuffle(sorted, newShifts);
+    }, 350);
+  }, [updateAnimState, startIdentityShuffle]);
 
   // STATE 2: Settled detection callback from individual score reels
   const handleReelSettled = useCallback(
     (teamId: string) => {
       settledTeamsRef.current.add(teamId);
       if (
-        affectedTeamIds.length > 0 &&
-        affectedTeamIds.every((id) => settledTeamsRef.current.has(id))
+        affectedTeamIdsRef.current.length > 0 &&
+        affectedTeamIdsRef.current.every((id) => settledTeamsRef.current.has(id))
       ) {
         if (spinTimerRef.current) clearTimeout(spinTimerRef.current);
         handleAllReelsSettled();
       }
     },
-    [affectedTeamIds, handleAllReelsSettled]
+    [handleAllReelsSettled]
   );
 
-  // STATE 4 FLIP: Invert and Play layout animation for physical rectangular nameplate & score shuffle
+  // STATE 4 FLIP: Move the SINGLE identity wrapper with shared transform
   useLayoutEffect(() => {
-    if (animState !== "NAMEPLATE_SHUFFLING" || !firstNameplateRectsRef.current) return;
+    if (animState !== "NAMEPLATE_SHUFFLING" || !firstRectsRef.current) return;
 
-    const firstPlates = firstNameplateRectsRef.current;
-    const firstScores = firstScoreRectsRef.current || {};
-    firstNameplateRectsRef.current = null;
-    firstScoreRectsRef.current = null;
+    const firstRects = firstRectsRef.current;
+    firstRectsRef.current = null;
 
-    const movingPlates: { el: HTMLElement; dx: number; dy: number; isUp: boolean }[] = [];
-    const movingScores: { el: HTMLElement; dx: number; dy: number; isUp: boolean }[] = [];
+    const movingWrappers: { el: HTMLElement; isUp: boolean; dx: number; dy: number }[] = [];
 
-    // FLIP Nameplates
-    document.querySelectorAll<HTMLElement>("[data-team-nameplate]").forEach((el) => {
-      const id = el.getAttribute("data-team-nameplate");
-      if (!id || !firstPlates[id]) return;
+    // Phase 1: BATCH READ (measure all bounding boxes in one contiguous pass without mutating DOM styles)
+    document.querySelectorAll<HTMLElement>("[data-team-identity]").forEach((el) => {
+      const id = el.getAttribute("data-team-identity");
+      if (!id || !firstRects[id]) return;
 
-      const first = firstPlates[id];
+      const first = firstRects[id];
       const last = el.getBoundingClientRect();
       const dx = first.left - last.left;
       const dy = first.top - last.top;
@@ -312,86 +477,56 @@ export function LiveScoreboard({
       if (Math.abs(dx) > 1 || Math.abs(dy) > 1) {
         const shift = pendingShiftsRef.current?.[id];
         const isUp = shift?.direction === "up";
-
-        // Invert: hold element at previous visual position
-        el.style.transform = `translate(${dx}px, ${dy}px)`;
-        el.style.transition = "none";
-        el.style.zIndex = isUp ? "60" : "45";
-
-        movingPlates.push({ el, dx, dy, isUp });
+        movingWrappers.push({ el, isUp, dx, dy });
       }
     });
 
-    // FLIP Corresponding Score Displays
-    document.querySelectorAll<HTMLElement>("[data-team-score]").forEach((el) => {
-      const id = el.getAttribute("data-team-score");
-      if (!id || !firstScores[id]) return;
-
-      const first = firstScores[id];
-      const last = el.getBoundingClientRect();
-      const dx = first.left - last.left;
-      const dy = first.top - last.top;
-
-      if (Math.abs(dx) > 1 || Math.abs(dy) > 1) {
-        const shift = pendingShiftsRef.current?.[id];
-        const isUp = shift?.direction === "up";
-
-        // Invert: hold score at previous visual position
-        el.style.transform = `translate(${dx}px, ${dy}px)`;
-        el.style.transition = "none";
-        el.style.zIndex = isUp ? "60" : "45";
-
-        movingScores.push({ el, dx, dy, isUp });
-      }
-    });
-
-    if (movingPlates.length === 0 && movingScores.length === 0) {
+    if (movingWrappers.length === 0) {
       setIsNameplateShuffling(false);
+      setShufflingTeamIds([]);
       updateAnimState("SETTLED");
       return;
     }
 
-    // PLAY: Animate to final positions in next animation frame
+    // Phase 2: BATCH WRITE (apply hardware-accelerated invert transforms in a single contiguous write pass)
+    movingWrappers.forEach(({ el, isUp, dx, dy }) => {
+      el.style.transform = `translate3d(${dx}px, ${dy}px, 0)`;
+      el.style.transition = "none";
+      el.style.zIndex = isUp ? "60" : "40";
+    });
+
+    // PLAY: Animate the single identity wrapper to final position with GPU acceleration
     const animFrame = requestAnimationFrame(() => {
       casinoSound.playNameplateShuffle();
       casinoSound.playScoreReveal(true);
 
-      movingPlates.forEach(({ el }) => {
+      movingWrappers.forEach(({ el }) => {
         el.style.transition = "transform 650ms cubic-bezier(0.22, 1, 0.36, 1)";
-        el.style.transform = "translate(0px, 0px)";
-      });
-
-      movingScores.forEach(({ el }) => {
-        el.style.transition = "transform 650ms cubic-bezier(0.22, 1, 0.36, 1)";
-        el.style.transform = "translate(0px, 0px)";
+        el.style.transform = "translate3d(0px, 0px, 0)";
       });
     });
 
     const slideDurationMs = 680;
     const timeout = setTimeout(() => {
       // Settle complete: clean up inline transform and z-index styles
-      movingPlates.forEach(({ el }) => {
-        el.style.transform = "";
-        el.style.transition = "";
-        el.style.zIndex = "";
-      });
-      movingScores.forEach(({ el }) => {
+      movingWrappers.forEach(({ el }) => {
         el.style.transform = "";
         el.style.transition = "";
         el.style.zIndex = "";
       });
 
       setIsNameplateShuffling(false);
+      setShufflingTeamIds([]);
       updateAnimState("SETTLED");
 
-      // STATE 5: Reveal Rank Indicators after nameplates have settled
+      // STATE 5: Reveal Rank Indicators after identity wrappers have settled
       if (pendingShiftsRef.current) {
         setRankShifts(pendingShiftsRef.current);
         pendingShiftsRef.current = null;
       }
 
       // Check if champion changed
-      const currentTopId = leaderboard[0]?.team_id;
+      const currentTopId = visualOrderRef.current[0];
       if (currentTopId && prevLeaderId.current && currentTopId !== prevLeaderId.current) {
         setCrownCelebration(true);
         casinoSound.playChampionFanfare();
@@ -412,44 +547,99 @@ export function LiveScoreboard({
       cancelAnimationFrame(animFrame);
       clearTimeout(timeout);
     };
-  }, [animState, leaderboard, updateAnimState]);
+  }, [animState, visualOrder, updateAnimState]);
+
+  // UNIFIED AUTHORITATIVE SCORE APPLICATOR
+  // Sets authoritative scores directly by stable team ID while freezing visualOrder
+  const applyAuthoritativeScores = useCallback(
+    (
+      newScores: Record<string, number>,
+      affected: string[],
+      deltas: Record<string, number>,
+      authoritativeTimestamp?: number
+    ) => {
+      const authTime = authoritativeTimestamp || Date.now();
+      if (authTime >= latestProcessedTimestampRef.current) {
+        latestProcessedTimestampRef.current = authTime;
+      }
+
+      // Update authoritative scores store
+      teamScoresRef.current = { ...teamScoresRef.current, ...newScores };
+      setTeamScores((prev) => ({ ...prev, ...newScores }));
+
+      // Safely schedule non-blocking cache update with authoritative absolute scores
+      if (typeof window !== "undefined" && eventId) {
+        const scheduleWrite =
+          typeof window.requestIdleCallback === "function"
+            ? window.requestIdleCallback
+            : (cb: () => void) => setTimeout(cb, 50);
+        scheduleWrite(() => {
+          updateLeaderboardCacheScores(eventId, newScores, authTime);
+        });
+      }
+
+      // Freeze visualOrder in current positions, start score rolling (STATE 1)
+      settledTeamsRef.current.clear();
+      affectedTeamIdsRef.current = affected;
+      setAffectedTeamIds(affected);
+      setScoreDeltas(deltas);
+      setIsSlotSpinning(true);
+      updateAnimState("SCORE_ROLLING");
+      casinoSound.startSlotRoll(1600);
+
+      // Fallback timer (3500ms) only fires if callbacks fail to complete
+      if (spinTimerRef.current) clearTimeout(spinTimerRef.current);
+      spinTimerRef.current = setTimeout(() => {
+        handleAllReelsSettled();
+      }, 3500);
+    },
+    [eventId, updateAnimState, handleAllReelsSettled]
+  );
 
   // Fetch latest leaderboard and round directly from Supabase view (authoritative source of truth)
   const refreshLeaderboard = useCallback(async () => {
     const requestId = ++latestRequestIdRef.current;
+    const requestStartTime = Date.now();
     try {
       const supabase = createClient();
 
-      // 1. Fetch active round (scoped to eventId)
+      // 1 & 2. Concurrently fetch active round and overall leaderboard (parallel client queries)
       let rndQuery = supabase
         .from("rounds")
         .select("*")
         .eq("status", "active")
         .is("deleted_at", null);
+
+      let lbQuery = supabase
+        .from("v_public_overall_leaderboard")
+        .select("*");
+
       if (eventId) {
         rndQuery = rndQuery.eq("event_id", eventId);
+        lbQuery = lbQuery.eq("event_id", eventId);
       }
-      const { data: rndData } = await rndQuery
+
+      const rndPromise = rndQuery
         .order("round_number", { ascending: false })
         .limit(1)
         .maybeSingle();
 
-      if (requestId !== latestRequestIdRef.current) return;
+      const lbPromise = lbQuery.order("rank", { ascending: true });
 
-      if (rndData) {
-        setActiveRound(rndData as Round);
-      }
-
-      // 2. Fetch authoritative overall leaderboard from view (scoped to eventId)
-      let lbQuery = supabase
-        .from("v_public_overall_leaderboard")
-        .select("*");
-      if (eventId) {
-        lbQuery = lbQuery.eq("event_id", eventId);
-      }
-      const { data: viewData, error } = await lbQuery.order("rank", { ascending: true });
+      const [rndResult, lbResult] = await Promise.all([rndPromise, lbPromise]);
 
       if (requestId !== latestRequestIdRef.current) return;
+      if (latestProcessedTimestampRef.current > requestStartTime) return;
+
+      if (rndResult.data) {
+        setActiveRound(rndResult.data as Round);
+      }
+
+      const viewData = lbResult.data;
+      const error = lbResult.error;
+
+      if (requestId !== latestRequestIdRef.current) return;
+      if (latestProcessedTimestampRef.current > requestStartTime) return;
 
       let nextLeaderboard: LeaderboardEntry[] = [];
 
@@ -476,7 +666,7 @@ export function LiveScoreboard({
         if (requestId !== latestRequestIdRef.current) return;
 
         if (tData && tData.length > 0) {
-          const startingScore = Number(settings?.starting_score || 0.0);
+          const startingScore = Number(settingsRef.current?.starting_score || 0.0);
           nextLeaderboard = (tData as Team[]).map((team, idx) => ({
             team_id: team.id,
             team_name: team.name,
@@ -490,147 +680,162 @@ export function LiveScoreboard({
 
       if (nextLeaderboard.length === 0) return;
       if (requestId !== latestRequestIdRef.current) return;
+      if (latestProcessedTimestampRef.current > requestStartTime) return;
 
-      // On initial load or page refresh, establish baseline without replaying stale animations
+      // Update teams catalog with any new metadata
+      setTeamsCatalog((prev) => {
+        const next = { ...prev };
+        nextLeaderboard.forEach((t) => {
+          next[t.team_id] = t;
+        });
+        return next;
+      });
+
+      // Persist latest authoritative snapshot to cache and mark live synced
+      if (eventId) {
+        saveScoreboardSnapshot({
+          eventId,
+          event: eventRef.current,
+          settings: settingsRef.current,
+          activeRound: rndResult.data ? (rndResult.data as Round) : activeRoundRef.current,
+          leaderboard: nextLeaderboard,
+          cachedAt: requestStartTime,
+        });
+        setHasReconciled(true);
+        setIsServingCache(false);
+      }
+
+      // On initial cold mount, establish baseline
       if (isInitialMountRef.current) {
         isInitialMountRef.current = false;
+        const initialMap: Record<string, number> = {};
         nextLeaderboard.forEach((t) => {
+          initialMap[t.team_id] = t.total_score;
           prevScoresRef.current[t.team_id] = t.total_score;
-          prevRanksRef.current[t.team_id] = t.rank;
         });
         prevLeaderId.current = nextLeaderboard[0]?.team_id || null;
-        setLeaderboard(nextLeaderboard);
+        teamScoresRef.current = initialMap;
+        setTeamScores(initialMap);
+        const initialOrder = nextLeaderboard.map((t) => t.team_id);
+        visualOrderRef.current = initialOrder;
+        setVisualOrder(initialOrder);
+        setHasReconciled(true);
+        setIsServingCache(false);
         return;
       }
 
-      // CRITICAL GUARD: If an animation is actively rolling or shuffling,
-      // do NOT mutate displayed leaderboard or disrupt the in-flight FLIP animation!
+      // If animation is in-flight, do not disrupt visual slots
       if (animStateRef.current !== "IDLE" && animStateRef.current !== "SETTLED") {
-        pendingRankedRef.current = nextLeaderboard;
         return;
       }
 
-      // Check which teams received actual score changes (detect deltas purely for animations)
+      // Check which teams received actual score changes
       const affected: string[] = [];
       const deltas: Record<string, number> = {};
+      const newScores: Record<string, number> = {};
 
       nextLeaderboard.forEach((team) => {
-        const oldScore = prevScoresRef.current[team.team_id];
-        if (oldScore !== undefined && oldScore !== team.total_score) {
+        const currentScore = teamScoresRef.current[team.team_id] ?? prevScoresRef.current[team.team_id];
+        if (currentScore !== undefined && currentScore !== team.total_score) {
           affected.push(team.team_id);
-          // Delta is the actual change from previous displayed score to authoritative new score.
-          deltas[team.team_id] = team.total_score - oldScore;
+          deltas[team.team_id] = team.total_score - currentScore;
         }
         prevScoresRef.current[team.team_id] = team.total_score;
+        newScores[team.team_id] = team.total_score;
       });
 
       if (affected.length > 0) {
-        // Target authoritative ranking
-        const sorted = [...nextLeaderboard].sort((a, b) => b.total_score - a.total_score);
-        const ranked = sorted.map((t, idx) => ({ ...t, rank: idx + 1 }));
-        pendingRankedRef.current = ranked;
-
-        // Keep teams in current visual slots, update total_score in-place so reels spin in current slots
-        setLeaderboard((prev) => {
-          const scoreMap: Record<string, number> = {};
-          nextLeaderboard.forEach((t) => {
-            scoreMap[t.team_id] = t.total_score;
-          });
-          return prev.map((t) => ({
-            ...t,
-            total_score: scoreMap[t.team_id] ?? t.total_score,
-          }));
-        });
-
-        settledTeamsRef.current.clear();
-        setAffectedTeamIds(affected);
-        setScoreDeltas(deltas);
-        setIsSlotSpinning(true);
-        updateAnimState("SCORE_ROLLING");
-        casinoSound.startSlotRoll(1600);
-
-        if (spinTimerRef.current) clearTimeout(spinTimerRef.current);
-        spinTimerRef.current = setTimeout(() => {
-          handleAllReelsSettled();
-        }, 3500);
+        applyAuthoritativeScores(newScores, affected, deltas);
       } else {
-        // No score changes (e.g. metadata/settings update)
-        setLeaderboard(nextLeaderboard);
+        // If scores are unchanged but metadata or teams list changed, update catalog
+        setVisualOrder((prev) => {
+          if (prev.length === 0) return nextLeaderboard.map((t) => t.team_id);
+          return prev;
+        });
       }
     } catch {
       // Handled gracefully
     }
-  }, [eventId, settings, updateAnimState, handleAllReelsSettled]);
+  }, [eventId, applyAuthoritativeScores]);
 
-  // Apply authoritative scores directly from real-time broadcast payload (resulting_score)
-  // This guarantees zero score drift, instant updates, and full idempotency
-  const applyDirectAuthoritativeScores = useCallback(
-    (scores: Record<string, number>) => {
-      setLeaderboard((prevLeaderboard) => {
-        const affected: string[] = [];
-        const deltas: Record<string, number> = {};
+  // Connection-aware adaptive polling scheduler (Stage 2 P1)
+  const scheduleNextPollRef = useRef<(customDelay?: number) => void>(() => {});
+  const setupRealtimeSubscriptionRef = useRef<() => void>(() => {});
 
-        // Keep existing visual slot order, update total_score in-place so reels spin in current slots
-        const inPlace = prevLeaderboard.map((team) => {
-          if (scores[team.team_id] !== undefined) {
-            const newScore = scores[team.team_id];
-            const oldScore = prevScoresRef.current[team.team_id] ?? team.total_score;
-            if (newScore !== oldScore) {
-              affected.push(team.team_id);
-              // Delta is purely for visual animation badges, calculated from old score to new authoritative resulting score
-              deltas[team.team_id] = newScore - oldScore;
-              prevScoresRef.current[team.team_id] = newScore;
-            }
-            return { ...team, total_score: newScore };
-          }
-          return team;
-        });
+  const scheduleNextPoll = useCallback(
+    (customDelay?: number) => {
+      if (pollingTimerRef.current) {
+        clearTimeout(pollingTimerRef.current);
+        pollingTimerRef.current = null;
+      }
 
-        if (affected.length === 0) {
-          return prevLeaderboard; // Idempotent: duplicate notification ignored
+      // Stop network polling when offline or when document is hidden
+      if (!isOnlineRef.current) return;
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
+
+      const delay =
+        customDelay ??
+        (channelStatusRef.current === "SUBSCRIBED"
+          ? SCOREBOARD_POLLING_CONFIG.HEALTHY_RECONCILIATION_INTERVAL_MS
+          : fallbackIntervalRef.current);
+
+      pollingTimerRef.current = setTimeout(async () => {
+        pollingTimerRef.current = null;
+        if (!isOnlineRef.current || (typeof document !== "undefined" && document.visibilityState === "hidden")) {
+          return;
         }
 
-        // Compute authoritative target ranking
-        const sorted = [...inPlace].sort((a, b) => b.total_score - a.total_score);
-        const ranked = sorted.map((t, idx) => ({ ...t, rank: idx + 1 }));
-        pendingRankedRef.current = ranked;
+        await refreshLeaderboard();
 
-        // Start score roll phase in current visual positions (STATE 1)
-        settledTeamsRef.current.clear();
-        setAffectedTeamIds(affected);
-        setScoreDeltas(deltas);
-        setIsSlotSpinning(true);
-        updateAnimState("SCORE_ROLLING");
-        casinoSound.startSlotRoll(1600);
+        // If Realtime remains unhealthy, apply exponential backoff
+        if (channelStatusRef.current !== "SUBSCRIBED") {
+          fallbackIntervalRef.current = Math.min(
+            fallbackIntervalRef.current * SCOREBOARD_POLLING_CONFIG.FALLBACK_BACKOFF_FACTOR,
+            SCOREBOARD_POLLING_CONFIG.FALLBACK_MAX_INTERVAL_MS
+          );
+        }
 
-        // Fallback timer (3500ms) only fires if callbacks fail to complete
-        if (spinTimerRef.current) clearTimeout(spinTimerRef.current);
-        spinTimerRef.current = setTimeout(() => {
-          handleAllReelsSettled();
-        }, 3500);
-
-        return inPlace;
-      });
+        scheduleNextPollRef.current();
+      }, delay);
     },
-    [updateAnimState, handleAllReelsSettled]
+    [refreshLeaderboard]
   );
 
-  // Realtime subscription to teams, rounds, event_settings and broadcast score updates
   useEffect(() => {
-    let channel: ReturnType<ReturnType<typeof createClient>["channel"]> | null = null;
+    scheduleNextPollRef.current = scheduleNextPoll;
+  }, [scheduleNextPoll]);
+
+  // Realtime subscription setup with full lifecycle and reconnection handling
+  const setupRealtimeSubscription = useCallback(() => {
+    if (channelRef.current) {
+      try {
+        const supabase = createClient();
+        supabase.removeChannel(channelRef.current);
+      } catch {
+        // Channel removal safe fallback
+      }
+      channelRef.current = null;
+    }
+
+    if (!isOnlineRef.current) {
+      channelStatusRef.current = "CLOSED";
+      return;
+    }
+
+    channelStatusRef.current = "CONNECTING";
+
     try {
       const supabase = createClient();
       const channelName = eventId ? `scoreboard:${eventId}` : "public-scoreboard-realtime";
 
-      channel = supabase
+      const channel = supabase
         .channel(channelName)
         .on("broadcast", { event: "score_update" }, (message) => {
           const payload = message?.payload;
           if (payload?.eventId && eventId && payload.eventId !== eventId) {
-            return; // Not for this event
+            return;
           }
           if (payload?.timestamp && payload.timestamp < latestProcessedTimestampRef.current) {
-            // Discard older out-of-order broadcast
             return;
           }
           if (payload?.timestamp) {
@@ -648,9 +853,24 @@ export function LiveScoreboard({
           }
 
           if (Object.keys(directScores).length > 0) {
-            applyDirectAuthoritativeScores(directScores);
+            const affected: string[] = [];
+            const deltas: Record<string, number> = {};
+            const newScores: Record<string, number> = { ...teamScoresRef.current };
+
+            Object.entries(directScores).forEach(([teamId, s]) => {
+              const currentScore = teamScoresRef.current[teamId] ?? prevScoresRef.current[teamId];
+              if (currentScore === undefined || currentScore !== s) {
+                affected.push(teamId);
+                deltas[teamId] = s - (currentScore ?? s);
+              }
+              prevScoresRef.current[teamId] = s;
+              newScores[teamId] = s;
+            });
+
+            if (affected.length > 0) {
+              applyAuthoritativeScores(newScores, affected, deltas, payload?.timestamp);
+            }
           } else {
-            // Fallback for non-score broadcast updates
             refreshLeaderboard();
           }
         })
@@ -675,25 +895,144 @@ export function LiveScoreboard({
             refreshLeaderboard();
           }
         )
-        .subscribe();
-    } catch {
-      // Realtime subscription setup fallback
-    }
+        .subscribe((status) => {
+          const currentStatus = status as RealtimeConnectionStatus;
+          channelStatusRef.current = currentStatus;
+          setChannelStatus(currentStatus);
 
-    const interval = setInterval(refreshLeaderboard, 5000);
+          if (currentStatus === "SUBSCRIBED") {
+            // Healthy Realtime connection confirmed
+            fallbackIntervalRef.current = SCOREBOARD_POLLING_CONFIG.FALLBACK_INITIAL_INTERVAL_MS;
+            if (reconnectTimerRef.current) {
+              clearTimeout(reconnectTimerRef.current);
+              reconnectTimerRef.current = null;
+            }
+            // Authoritative server reconciliation
+            refreshLeaderboard().then(() => {
+              scheduleNextPollRef.current(SCOREBOARD_POLLING_CONFIG.HEALTHY_RECONCILIATION_INTERVAL_MS);
+            });
+          } else if (
+            currentStatus === "CHANNEL_ERROR" ||
+            currentStatus === "TIMED_OUT" ||
+            currentStatus === "CLOSED"
+          ) {
+            // Unhealthy Realtime: activate fallback exponential backoff polling
+            scheduleNextPollRef.current(fallbackIntervalRef.current);
+
+            // Debounced subscription retry if browser is online
+            if (isOnlineRef.current && !reconnectTimerRef.current) {
+              reconnectTimerRef.current = setTimeout(() => {
+                reconnectTimerRef.current = null;
+                if (isOnlineRef.current && channelStatusRef.current !== "SUBSCRIBED") {
+                  setupRealtimeSubscriptionRef.current();
+                }
+              }, Math.max(SCOREBOARD_POLLING_CONFIG.RECONNECT_DEBOUNCE_MS, fallbackIntervalRef.current));
+            }
+          }
+        });
+
+      channelRef.current = channel;
+    } catch {
+      channelStatusRef.current = "CHANNEL_ERROR";
+      scheduleNextPollRef.current(fallbackIntervalRef.current);
+    }
+  }, [eventId, refreshLeaderboard, applyAuthoritativeScores]);
+
+  useEffect(() => {
+    setupRealtimeSubscriptionRef.current = setupRealtimeSubscription;
+  }, [setupRealtimeSubscription]);
+
+  // Realtime subscription lifecycle & unmount timer cleanup
+  useEffect(() => {
+    setupRealtimeSubscription();
 
     return () => {
-      if (channel) {
-        const supabase = createClient();
-        supabase.removeChannel(channel);
+      if (channelRef.current) {
+        try {
+          const supabase = createClient();
+          supabase.removeChannel(channelRef.current);
+        } catch {
+          // Safe ignore
+        }
+        channelRef.current = null;
       }
-      clearInterval(interval);
+      if (pollingTimerRef.current) {
+        clearTimeout(pollingTimerRef.current);
+        pollingTimerRef.current = null;
+      }
+      if (reconnectTimerRef.current) {
+        clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
+      }
       if (spinTimerRef.current) clearTimeout(spinTimerRef.current);
       if (pauseTimerRef.current) clearTimeout(pauseTimerRef.current);
       if (rankResetTimerRef.current) clearTimeout(rankResetTimerRef.current);
       casinoSound.stopSlotRoll();
     };
-  }, [eventId, refreshLeaderboard, applyDirectAuthoritativeScores]);
+  }, [setupRealtimeSubscription]);
+
+  // Online / offline network connectivity monitoring side-effects
+  useEffect(() => {
+    const handleOnline = () => {
+      isOnlineRef.current = true;
+      fallbackIntervalRef.current = SCOREBOARD_POLLING_CONFIG.FALLBACK_INITIAL_INTERVAL_MS;
+
+      // Reconcile authoritative data immediately upon reconnection
+      refreshLeaderboard();
+
+      if (channelStatusRef.current !== "SUBSCRIBED") {
+        setupRealtimeSubscription();
+      } else {
+        scheduleNextPoll(SCOREBOARD_POLLING_CONFIG.HEALTHY_RECONCILIATION_INTERVAL_MS);
+      }
+    };
+
+    const handleOffline = () => {
+      isOnlineRef.current = false;
+
+      // Stop all background polling and reconnect attempts when offline
+      if (pollingTimerRef.current) {
+        clearTimeout(pollingTimerRef.current);
+        pollingTimerRef.current = null;
+      }
+      if (reconnectTimerRef.current) {
+        clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
+      }
+    };
+
+    window.addEventListener("online", handleOnline);
+    window.addEventListener("offline", handleOffline);
+
+    return () => {
+      window.removeEventListener("online", handleOnline);
+      window.removeEventListener("offline", handleOffline);
+    };
+  }, [refreshLeaderboard, scheduleNextPoll, setupRealtimeSubscription]);
+
+  // Tab visibility change monitoring (document.visibilityState)
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "hidden") {
+        // Tab backgrounded: pause polling timers to conserve network bandwidth
+        if (pollingTimerRef.current) {
+          clearTimeout(pollingTimerRef.current);
+          pollingTimerRef.current = null;
+        }
+      } else if (document.visibilityState === "visible") {
+        // Tab foregrounded: reconcile any updates missed while hidden
+        if (isOnlineRef.current) {
+          refreshLeaderboard();
+          scheduleNextPoll();
+        }
+      }
+    };
+
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => {
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
+  }, [refreshLeaderboard, scheduleNextPoll]);
 
   const toggleFullscreen = useCallback(() => {
     if (!document.fullscreenElement) {
@@ -722,10 +1061,70 @@ export function LiveScoreboard({
     setIsAudioMuted(isMuted);
   };
 
-  const top1 = leaderboard[0] || null;
-  const top2 = leaderboard[1] || null;
-  const top3 = leaderboard[2] || null;
-  const rest = leaderboard.slice(3);
+  const top1Id = visualOrder[0] || null;
+  const top2Id = visualOrder[1] || null;
+  const top3Id = visualOrder[2] || null;
+  const restIds = visualOrder.slice(3);
+
+  const top1 = top1Id ? teamsCatalog[top1Id] || null : null;
+  const top2 = top2Id ? teamsCatalog[top2Id] || null : null;
+  const top3 = top3Id ? teamsCatalog[top3Id] || null : null;
+
+  // Deterministic connection status for hydration and live states
+  const getPillStatus = () => {
+    // 1. Initial hydration pass and SSR: deterministic markup (never reads browser APIs or socket)
+    if (!isMounted) {
+      return {
+        dotColor: "bg-sky-400 animate-pulse",
+        text: initialLeaderboard && initialLeaderboard.length > 0
+          ? "CACHED • SYNCING..."
+          : "SYNCING...",
+      };
+    }
+
+    // 2. Offline: browser network connectivity is unavailable
+    if (!isOnline) {
+      return {
+        dotColor: "bg-amber-400",
+        text: "OFFLINE • CACHED STANDINGS",
+      };
+    }
+
+    // 3. Realtime connection unavailable or interrupted
+    if (channelStatus !== "SUBSCRIBED") {
+      // While initial connection handshake & reconciliation are in progress, show CACHED • SYNCING...
+      if (!hasReconciled && channelStatus === "CONNECTING") {
+        return {
+          dotColor: "bg-sky-400 animate-pulse",
+          text: isServingCache || (initialLeaderboard && initialLeaderboard.length > 0)
+            ? "CACHED • SYNCING..."
+            : "SYNCING...",
+        };
+      }
+      return {
+        dotColor: "bg-amber-400 animate-pulse",
+        text: "RECONNECTING...",
+      };
+    }
+
+    // 4. Subscribed, but awaiting initial authoritative reconciliation or serving stale cached standings
+    if (isServingCache || !hasReconciled) {
+      return {
+        dotColor: "bg-sky-400 animate-pulse",
+        text: "CACHED • SYNCING...",
+      };
+    }
+
+    // 5. LIVE: confirmed Realtime subscription and reconciled authoritative data
+    return {
+      dotColor: "bg-emerald-400 animate-pulse",
+      text: activeRound
+        ? `Round ${activeRound.round_number}: ${activeRound.name}`
+        : "Round 1: Main Event",
+    };
+  };
+
+  const pillStatus = getPillStatus();
 
   return (
     <div className="h-screen w-screen max-h-screen overflow-hidden bg-[#050508] text-foreground flex flex-col justify-between p-3 sm:p-5 lg:p-6 select-none relative font-sans">
@@ -815,14 +1214,15 @@ export function LiveScoreboard({
         </div>
 
         <div className="flex items-center gap-2">
-          {/* Smooth Round Indicator Pill */}
+          {/* Smooth Round Indicator Pill / Connection Health Status */}
           <div className="inline-flex items-center gap-2 px-3 py-0.5 rounded-full bg-[#120a10]/85 border border-gold/35 text-xs sm:text-sm tracking-widest text-gold uppercase font-bold backdrop-blur-md shadow-md transition-all duration-500">
-            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-            <span>
-              {activeRound
-                ? `Round ${activeRound.round_number}: ${activeRound.name}`
-                : "Round 1: Main Event"}
-            </span>
+            <span
+              className={cn(
+                "w-1.5 h-1.5 rounded-full",
+                pillStatus.dotColor
+              )}
+            />
+            <span>{pillStatus.text}</span>
           </div>
 
           {/* Slot Machine Reveal Status Pill */}
@@ -863,7 +1263,7 @@ export function LiveScoreboard({
 
       {/* MAIN STAGE: 3D Casino Podium + Remaining Teams Standings */}
       <main className="flex-1 flex flex-col justify-center my-auto relative z-20 max-w-6xl mx-auto w-full">
-        {leaderboard.length === 0 ? (
+        {visualOrder.length === 0 ? (
           /* ELEGANT AWAITING SCORES STATE */
           <div className="flex flex-col items-center justify-center text-center py-10 px-6 space-y-5 rounded-3xl border border-gold/30 bg-card/60 backdrop-blur-xl max-w-md mx-auto shadow-[0_0_40px_rgba(0,0,0,0.8)] relative overflow-hidden animate-podium-in">
             <div className="relative w-28 h-28 flex items-center justify-center">
@@ -890,305 +1290,70 @@ export function LiveScoreboard({
           <div className="space-y-3 sm:space-y-4 animate-podium-in w-full">
             {/* TOP 3 PODIUM PRESENTATION WITH PROMINENT VISUAL HIERARCHY */}
             <div className="grid grid-cols-3 gap-2.5 sm:gap-6 items-end max-w-4xl mx-auto w-full pt-1">
-              {/* RANK 2: SILVER / CHROME PODIUM */}
-              <div className="flex flex-col items-center transition-all duration-700 ease-out">
-                {top2 ? (
-                  <div className="w-full rounded-2xl border-2 border-slate-300/70 bg-gradient-to-b from-[#181d26]/95 via-[#0e1218]/95 to-[#06080c]/98 backdrop-blur-xl p-3 sm:p-5 text-center space-y-2 shadow-[0_10px_30px_rgba(0,0,0,0.7)] hover:border-slate-200 transition-all duration-500 relative">
-                    {/* Metallic Shimmer Sweep in inner clipped container */}
-                    <div className="absolute inset-0 rounded-2xl overflow-hidden pointer-events-none">
-                      <div className="absolute inset-0 pointer-events-none bg-gradient-to-r from-transparent via-white/8 to-transparent animate-shimmer-sweep" />
-                    </div>
+              <PodiumCard
+                variant="silver"
+                team={top2}
+                currentScore={top2 ? (teamScores[top2.team_id] ?? top2.total_score) : 0}
+                scoreDelta={top2 ? (scoreDeltas[top2.team_id] ?? null) : null}
+                isSpinning={top2 ? (isSlotSpinning && affectedTeamIds.includes(top2.team_id)) : false}
+                isShuffling={top2 ? (isNameplateShuffling && shufflingTeamIds.includes(top2.team_id)) : false}
+                shiftInfo={top2 ? rankShifts[top2.team_id] : undefined}
+                staggerDelay={1000}
+                onReelSettled={handleReelSettled}
+              />
 
-                    {/* Rank Shift Indicator */}
-                    {rankShifts[top2.team_id] && (
-                      <div className="absolute top-2 right-2 flex items-center gap-0.5 px-2 py-0.5 rounded-full text-[10px] font-black bg-emerald/20 text-emerald-300 border border-emerald/50 animate-bounce z-20">
-                        {rankShifts[top2.team_id].direction === "up" ? (
-                          <TrendingUp className="w-3 h-3 text-emerald-400" />
-                        ) : (
-                          <TrendingDown className="w-3 h-3 text-casino-red" />
-                        )}
-                        <span>
-                          {rankShifts[top2.team_id].direction === "up"
-                            ? `▲ ${rankShifts[top2.team_id].from - rankShifts[top2.team_id].to}`
-                            : `▼ ${rankShifts[top2.team_id].to - rankShifts[top2.team_id].from}`}
-                        </span>
-                      </div>
-                    )}
+              <PodiumCard
+                variant="champion"
+                team={top1}
+                currentScore={top1 ? (teamScores[top1.team_id] ?? top1.total_score) : 0}
+                scoreDelta={top1 ? (scoreDeltas[top1.team_id] ?? null) : null}
+                isSpinning={top1 ? (isSlotSpinning && affectedTeamIds.includes(top1.team_id)) : false}
+                isShuffling={top1 ? (isNameplateShuffling && shufflingTeamIds.includes(top1.team_id)) : false}
+                shiftInfo={top1 ? rankShifts[top1.team_id] : undefined}
+                crownCelebration={crownCelebration}
+                staggerDelay={900}
+                onReelSettled={handleReelSettled}
+              />
 
-                    {/* Stationary Trophy & Rank Badge */}
-                    <div className="w-10 h-10 sm:w-12 sm:h-12 rounded-full bg-slate-300/20 border border-slate-300/60 text-slate-100 flex items-center justify-center mx-auto shadow-[0_0_20px_rgba(148,163,184,0.35)]">
-                      <Trophy className="w-5 h-5 sm:w-6 sm:h-6 text-slate-100" />
-                    </div>
-
-                    <span className="text-[10px] sm:text-xs font-bold text-slate-300 uppercase tracking-widest block font-mono">
-                      Rank 2 • Silver
-                    </span>
-
-                    {/* Moving Team Identity: Rectangular Nameplate & Settled Score Reel */}
-                    <div
-                      data-team-identity={top2.team_id}
-                      className="space-y-2 flex flex-col items-center w-full relative"
-                    >
-                      <TeamNameplate
-                        teamId={top2.team_id}
-                        teamName={top2.team_name}
-                        teamColor={top2.team_color}
-                        variant="silver"
-                        isShuffling={isNameplateShuffling}
-                        className="w-full max-w-[210px] sm:max-w-[250px]"
-                      />
-
-                      {/* Mechanical Slot Machine Number Reel for Rank 2 */}
-                      <div
-                        data-team-score={top2.team_id}
-                        className="pt-2 border-t border-slate-400/25 flex justify-center w-full will-change-transform"
-                      >
-                        <SlotScoreReel
-                          value={top2.total_score}
-                          delta={scoreDeltas[top2.team_id] ?? null}
-                          isSpinning={isSlotSpinning && affectedTeamIds.includes(top2.team_id)}
-                          staggerDelay={1000}
-                          variant="silver"
-                          onSettled={() => handleReelSettled(top2.team_id)}
-                        />
-                      </div>
-                    </div>
-                  </div>
-                ) : (
-                  <div className="w-full h-32 rounded-2xl border border-dashed border-border/40 flex items-center justify-center text-xs text-muted-foreground uppercase">
-                    Rank 2
-                  </div>
-                )}
-                {/* Silver Pedestal Base */}
-                <div className="hidden sm:block w-4/5 h-4 bg-gradient-to-r from-slate-400/20 via-slate-300/40 to-slate-400/20 border-x border-b border-slate-300/50 rounded-b-xl shadow-md" />
-              </div>
-
-              {/* RANK 1: DOMINANT ROYAL GOLD CHAMPION PODIUM (CENTER & ELEVATED) */}
-              <div className="flex flex-col items-center -translate-y-3 sm:-translate-y-7 transition-all duration-700 ease-out z-10 relative">
-                {/* Golden Spotlight from above illuminating Rank 1 */}
-                <div className="absolute -top-36 left-1/2 -translate-x-1/2 w-72 sm:w-88 h-[400px] bg-gradient-to-b from-amber-200/25 via-gold/15 to-transparent blur-2xl pointer-events-none animate-champion-spotlight -z-10" />
-
-                {top1 ? (
-                  <div
-                    className={cn(
-                      "w-full rounded-3xl border-2 border-[#f0c85a] bg-gradient-to-b from-[#281a08]/98 via-[#150d05]/98 to-[#060404]/98 backdrop-blur-xl p-4 sm:p-6 text-center space-y-2.5 transition-all duration-700 relative",
-                      crownCelebration
-                        ? "ring-4 ring-gold shadow-[0_0_80px_rgba(240,200,90,0.85)] scale-105"
-                        : "shadow-[0_0_55px_rgba(212,168,67,0.45)]"
-                    )}
-                  >
-                    {/* Golden Shimmer Sweep in inner clipped container */}
-                    <div className="absolute inset-0 rounded-3xl overflow-hidden pointer-events-none">
-                      <div className="absolute inset-0 pointer-events-none bg-gradient-to-r from-transparent via-gold/12 to-transparent animate-shimmer-sweep" />
-                    </div>
-
-                    {/* Rank Shift Indicator */}
-                    {rankShifts[top1.team_id] && (
-                      <div className="absolute top-2.5 right-2.5 flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-black bg-gold/30 text-gold-bright border border-gold shadow-lg animate-bounce z-20">
-                        <TrendingUp className="w-3.5 h-3.5 text-gold-bright" />
-                        <span>NEW LEADER</span>
-                      </div>
-                    )}
-
-                    {/* Stationary Gold Crown Badge with Aura */}
-                    <div className="w-12 h-12 sm:w-16 sm:h-16 rounded-full bg-gradient-to-b from-gold/40 to-gold/10 border-2 border-[#f0c85a] text-gold flex items-center justify-center mx-auto shadow-[0_0_28px_rgba(240,200,90,0.6)]">
-                      <Crown
-                        className={cn(
-                          "w-6 h-6 sm:w-9 sm:h-9 text-gold-bright",
-                          crownCelebration ? "animate-bounce" : "animate-crown-glow"
-                        )}
-                      />
-                    </div>
-
-                    <span className="text-[11px] sm:text-xs font-black text-gold uppercase tracking-widest block font-mono">
-                      Rank 1 • Champion
-                    </span>
-
-                    {/* Moving Team Identity: Rectangular Nameplate & Settled Score Reel */}
-                    <div
-                      data-team-identity={top1.team_id}
-                      className="space-y-2.5 flex flex-col items-center w-full relative"
-                    >
-                      <TeamNameplate
-                        teamId={top1.team_id}
-                        teamName={top1.team_name}
-                        teamColor={top1.team_color}
-                        variant="champion"
-                        isShuffling={isNameplateShuffling}
-                        className="w-full max-w-[220px] sm:max-w-[270px]"
-                      />
-
-                      {/* Mechanical Slot Machine Number Reel for Rank 1 */}
-                      <div
-                        data-team-score={top1.team_id}
-                        className="pt-2.5 border-t border-gold/45 flex justify-center w-full will-change-transform"
-                      >
-                        <SlotScoreReel
-                          value={top1.total_score}
-                          delta={scoreDeltas[top1.team_id] ?? null}
-                          isSpinning={isSlotSpinning && affectedTeamIds.includes(top1.team_id)}
-                          staggerDelay={900}
-                          variant="champion"
-                          onSettled={() => handleReelSettled(top1.team_id)}
-                        />
-                      </div>
-                    </div>
-                  </div>
-                ) : (
-                  <div className="w-full h-40 rounded-3xl border border-dashed border-gold/40 flex items-center justify-center text-xs text-gold uppercase">
-                    Rank 1
-                  </div>
-                )}
-                {/* Royal Gold Pedestal Base */}
-                <div className="hidden sm:block w-5/6 h-6 bg-gradient-to-r from-gold/30 via-gold/60 to-gold/30 border-x border-b border-gold/70 rounded-b-2xl shadow-[0_8px_25px_rgba(212,168,67,0.4)] animate-pedestal-gold" />
-              </div>
-
-              {/* RANK 3: CASINO RED & BRONZE PODIUM */}
-              <div className="flex flex-col items-center transition-all duration-700 ease-out">
-                {top3 ? (
-                  <div className="w-full rounded-2xl border-2 border-casino-red/70 bg-gradient-to-b from-[#280c10]/95 via-[#150608]/95 to-[#080204]/98 backdrop-blur-xl p-3 sm:p-5 text-center space-y-2 shadow-[0_10px_30px_rgba(0,0,0,0.7)] hover:border-casino-red transition-all duration-500 relative">
-                    {/* Metallic Shimmer Sweep in inner clipped container */}
-                    <div className="absolute inset-0 rounded-2xl overflow-hidden pointer-events-none">
-                      <div className="absolute inset-0 pointer-events-none bg-gradient-to-r from-transparent via-amber-400/8 to-transparent animate-shimmer-sweep" />
-                    </div>
-
-                    {/* Rank Shift Indicator */}
-                    {rankShifts[top3.team_id] && (
-                      <div className="absolute top-2 right-2 flex items-center gap-0.5 px-2 py-0.5 rounded-full text-[10px] font-black bg-amber-500/20 text-amber-300 border border-amber-500/50 animate-bounce z-20">
-                        {rankShifts[top3.team_id].direction === "up" ? (
-                          <TrendingUp className="w-3 h-3 text-amber-400" />
-                        ) : (
-                          <TrendingDown className="w-3 h-3 text-casino-red" />
-                        )}
-                        <span>
-                          {rankShifts[top3.team_id].direction === "up"
-                            ? `▲ ${rankShifts[top3.team_id].from - rankShifts[top3.team_id].to}`
-                            : `▼ ${rankShifts[top3.team_id].to - rankShifts[top3.team_id].from}`}
-                        </span>
-                      </div>
-                    )}
-
-                    {/* Stationary Medal & Rank Badge */}
-                    <div className="w-10 h-10 sm:w-12 sm:h-12 rounded-full bg-casino-red/25 border border-casino-red/60 text-[#ffb399] flex items-center justify-center mx-auto shadow-[0_0_20px_rgba(192,57,43,0.4)]">
-                      <Medal className="w-5 h-5 sm:w-6 sm:h-6 text-[#ffb399]" />
-                    </div>
-
-                    <span className="text-[10px] sm:text-xs font-bold text-red-300 uppercase tracking-widest block font-mono">
-                      Rank 3 • Bronze
-                    </span>
-
-                    {/* Moving Team Identity: Rectangular Nameplate & Settled Score Reel */}
-                    <div
-                      data-team-identity={top3.team_id}
-                      className="space-y-2 flex flex-col items-center w-full relative"
-                    >
-                      <TeamNameplate
-                        teamId={top3.team_id}
-                        teamName={top3.team_name}
-                        teamColor={top3.team_color}
-                        variant="bronze"
-                        isShuffling={isNameplateShuffling}
-                        className="w-full max-w-[210px] sm:max-w-[250px]"
-                      />
-
-                      {/* Mechanical Slot Machine Number Reel for Rank 3 */}
-                      <div
-                        data-team-score={top3.team_id}
-                        className="pt-2 border-t border-casino-red/35 flex justify-center w-full will-change-transform"
-                      >
-                        <SlotScoreReel
-                          value={top3.total_score}
-                          delta={scoreDeltas[top3.team_id] ?? null}
-                          isSpinning={isSlotSpinning && affectedTeamIds.includes(top3.team_id)}
-                          staggerDelay={1100}
-                          variant="bronze"
-                          onSettled={() => handleReelSettled(top3.team_id)}
-                        />
-                      </div>
-                    </div>
-                  </div>
-                ) : (
-                  <div className="w-full h-32 rounded-2xl border border-dashed border-border/40 flex items-center justify-center text-xs text-muted-foreground uppercase">
-                    Rank 3
-                  </div>
-                )}
-                {/* Bronze / Red Pedestal Base */}
-                <div className="hidden sm:block w-4/5 h-4 bg-gradient-to-r from-casino-red/30 via-amber-600/40 to-casino-red/30 border-x border-b border-casino-red/50 rounded-b-xl shadow-md" />
-              </div>
+              <PodiumCard
+                variant="bronze"
+                team={top3}
+                currentScore={top3 ? (teamScores[top3.team_id] ?? top3.total_score) : 0}
+                scoreDelta={top3 ? (scoreDeltas[top3.team_id] ?? null) : null}
+                isSpinning={top3 ? (isSlotSpinning && affectedTeamIds.includes(top3.team_id)) : false}
+                isShuffling={top3 ? (isNameplateShuffling && shufflingTeamIds.includes(top3.team_id)) : false}
+                shiftInfo={top3 ? rankShifts[top3.team_id] : undefined}
+                staggerDelay={1100}
+                onReelSettled={handleReelSettled}
+              />
             </div>
 
             {/* REMAINING TEAMS: DYNAMICALLY ALIGNED CHAMPIONSHIP STANDINGS PANEL (#4 ONWARDS) */}
-            {rest.length > 0 && (
+            {restIds.length > 0 && (
               <div className="rounded-2xl border border-gold/30 bg-[#0c0810]/92 backdrop-blur-xl p-3 sm:p-4.5 max-w-6xl mx-auto w-full shadow-[0_12px_35px_rgba(0,0,0,0.85)] transition-all">
-                <div className={getRestContainerClass(rest.length)}>
-                  {rest.map((team, idx) => {
+                <div className={getRestContainerClass(restIds.length)}>
+                  {restIds.map((teamId, idx) => {
+                    const team = teamsCatalog[teamId];
+                    if (!team) return null;
                     const shift = rankShifts[team.team_id];
                     const isTeamSpinning = isSlotSpinning && affectedTeamIds.includes(team.team_id);
                     const teamDelta = scoreDeltas[team.team_id] ?? null;
+                    const currentScore = teamScores[team.team_id] ?? team.total_score;
 
                     return (
-                      <div
+                      <LeaderboardRow
                         key={team.team_id}
-                        className={cn(
-                          "h-14 sm:h-16 flex items-center justify-between px-3.5 sm:px-4 rounded-xl border border-white/10 bg-[#130b14]/85 hover:border-gold/50 hover:bg-[#1c0f1c]/90 transition-all duration-300 shadow-sm relative",
-                          shift && "border-gold/60 bg-gold/10",
-                          getRestItemClass(idx, rest.length)
-                        )}
-                      >
-                        {/* Fixed Stationary Rank Badge & Shift Indicator */}
-                        <div className="flex items-center gap-2.5 shrink-0 z-10">
-                          <span className="flex items-center justify-center w-8 h-8 rounded-lg bg-black/85 border border-gold/40 text-xs sm:text-sm font-mono font-bold text-gold-bright shrink-0 shadow-sm">
-                            #{team.rank}
-                          </span>
-
-                          {shift && (
-                            <span
-                              className={cn(
-                                "flex items-center gap-0.5 text-[10px] sm:text-xs font-bold shrink-0 animate-bounce",
-                                shift.direction === "up" ? "text-emerald-400" : "text-casino-red"
-                              )}
-                            >
-                              {shift.direction === "up" ? (
-                                <TrendingUp className="w-3.5 h-3.5" />
-                              ) : (
-                                <TrendingDown className="w-3.5 h-3.5" />
-                              )}
-                              <span>
-                                {shift.direction === "up" ? `+${shift.from - shift.to}` : `-${shift.to - shift.from}`}
-                              </span>
-                            </span>
-                          )}
-                        </div>
-
-                        {/* Moving Team Identity: Rectangular Nameplate & Settled Score Reel */}
-                        <div
-                          data-team-identity={team.team_id}
-                          className="flex items-center justify-between flex-1 min-w-0 pl-3 relative"
-                        >
-                          <TeamNameplate
-                            teamId={team.team_id}
-                            teamName={team.team_name}
-                            teamColor={team.team_color}
-                            variant="standard"
-                            isShuffling={isNameplateShuffling}
-                            className="max-w-[210px] sm:max-w-[250px]"
-                          />
-
-                          <div
-                            data-team-score={team.team_id}
-                            className="text-right shrink-0 will-change-transform"
-                          >
-                            <SlotScoreReel
-                              value={team.total_score}
-                              delta={teamDelta}
-                              isSpinning={isTeamSpinning}
-                              staggerDelay={1000 + Math.min(idx * 120, 360)}
-                              variant="standard"
-                              onSettled={() => handleReelSettled(team.team_id)}
-                            />
-                          </div>
-                        </div>
-                      </div>
+                        team={team}
+                        rank={idx + 4}
+                        currentScore={currentScore}
+                        scoreDelta={teamDelta}
+                        isSpinning={isTeamSpinning}
+                        isShuffling={isNameplateShuffling && shufflingTeamIds.includes(team.team_id)}
+                        shiftInfo={shift}
+                        staggerDelay={1000 + Math.min(idx * 120, 360)}
+                        itemClass={getRestItemClass(idx, restIds.length)}
+                        onReelSettled={handleReelSettled}
+                      />
                     );
                   })}
                 </div>

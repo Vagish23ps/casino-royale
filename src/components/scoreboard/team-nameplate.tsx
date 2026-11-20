@@ -12,8 +12,7 @@ export interface TeamNameplateProps {
   isShuffling?: boolean;
 }
 
-export function TeamNameplate({
-  teamId,
+export const TeamNameplate = React.memo(function TeamNameplate({
   teamName,
   teamColor,
   variant = "standard",
@@ -46,11 +45,10 @@ export function TeamNameplate({
 
   return (
     <div
-      data-team-nameplate={teamId}
       className={cn(
-        "relative flex items-center justify-center px-3.5 sm:px-4.5 h-10 sm:h-11 rounded-lg sm:rounded-xl select-none will-change-transform transition-all duration-300",
+        "relative flex items-center justify-center px-3.5 sm:px-4.5 h-10 sm:h-11 rounded-lg sm:rounded-xl select-none transition-[box-shadow,border-color] duration-300",
         plateStyling,
-        isShuffling && "shadow-[0_10px_35px_rgba(212,168,67,0.55)] border-gold ring-1 ring-gold/60 scale-[1.02]",
+        isShuffling && "shadow-[0_10px_35px_rgba(212,168,67,0.55)] border-gold ring-1 ring-gold/60",
         className
       )}
     >
@@ -66,4 +64,4 @@ export function TeamNameplate({
       <span className={fontStyling}>{teamName}</span>
     </div>
   );
-}
+});
